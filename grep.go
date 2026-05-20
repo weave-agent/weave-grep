@@ -210,6 +210,7 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 	var collector *progressCollector
 	if bus != nil {
 		collector = newProgressCollector(ctx, bus)
+		defer collector.cancel()
 	}
 
 	matches, searchErr := t.search(ctx, params.absPath, params.isDir, params.pattern, params.include, params.ignoreCase, params.literal, params.contextLines, params.respectGitignore, func(file, _ string) {
@@ -220,10 +221,6 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 
 	// Publish final progress event
 	if collector != nil {
-		if collector.cancel != nil {
-			collector.cancel()
-		}
-
 		collector.publish()
 	}
 
@@ -321,7 +318,7 @@ func (t *tool) search(ctx context.Context, absPath string, isDir bool, pattern, 
 
 func searchWithStdlib(ctx context.Context, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, onMatch func(file, match string)) ([]string, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("search canceled: %w", err)
+		return nil, nil //nolint:nilerr // return partial matches on cancellation
 	}
 
 	expr := pattern
@@ -631,9 +628,11 @@ func searchFile(ctx context.Context, displayPath, filePath string, re *regexp.Re
 	var results []string
 
 	matched := make(map[int]bool)
+	isMatch := make(map[int]bool)
 
 	for i, line := range lines {
 		if re.MatchString(line) {
+			isMatch[i] = true
 			for j := max(0, i-contextLines); j <= min(len(lines)-1, i+contextLines); j++ {
 				matched[j] = true
 			}
@@ -645,7 +644,7 @@ func searchFile(ctx context.Context, displayPath, filePath string, re *regexp.Re
 			result := fmt.Sprintf("%s:%d:%s", displayPath, i+1, lines[i])
 			results = append(results, result)
 
-			if onMatch != nil && re.MatchString(lines[i]) {
+			if onMatch != nil && isMatch[i] {
 				onMatch(displayPath, result)
 			}
 		}
