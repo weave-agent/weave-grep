@@ -261,12 +261,19 @@ func (pc *progressCollector) add(match string) {
 	pc.mu.Lock()
 	pc.matchCount++
 
-	// Match format is path:line:content. Find the colon before the line number
-	// to extract the file path. On Windows, absolute paths contain colons
-	// (e.g. C:\dir\file.go), so we find the last two colons.
-	if lastColon := strings.LastIndex(match, ":"); lastColon > 0 {
-		if prevColon := strings.LastIndex(match[:lastColon], ":"); prevColon > 0 {
-			pc.currentFile = match[:prevColon]
+	// Match format is path:line:content. Find the first :digits: segment
+	// to extract the file path. The line number is always digits only.
+	for i := range len(match) {
+		if match[i] == ':' {
+			j := i + 1
+			for j < len(match) && match[j] >= '0' && match[j] <= '9' {
+				j++
+			}
+
+			if j > i+1 && j < len(match) && match[j] == ':' {
+				pc.currentFile = match[:i]
+				break
+			}
 		}
 	}
 
@@ -616,10 +623,6 @@ func searchFile(ctx context.Context, displayPath, filePath string, re *regexp.Re
 	}
 
 	if err := scanner.Err(); err != nil && ctx.Err() == nil {
-		return nil
-	}
-
-	if ctx.Err() != nil {
 		return nil
 	}
 

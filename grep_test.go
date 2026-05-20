@@ -459,9 +459,9 @@ func TestSearchFileContextCanceled(t *testing.T) {
 }
 
 func TestSearchFileContextCanceledMidScan(t *testing.T) {
-	// Create a large file so scanning takes long enough for cancel to fire.
-	lines := make([]string, 0, 300000)
-	for i := range 300000 {
+	// Create a large file (just under 10MB limit) so scanning takes long enough for cancel to fire.
+	lines := make([]string, 0, 150000)
+	for i := range 150000 {
 		lines = append(lines, fmt.Sprintf("line %d with findme target content to make lines longer", i))
 	}
 
@@ -485,9 +485,9 @@ func TestSearchFileContextCanceledMidScan(t *testing.T) {
 
 	select {
 	case matches := <-done:
-		// May return partial matches or nil depending on when cancel fires.
-		// The key assertion is that it returns promptly without scanning all lines.
-		_ = matches
+		// Partial results should be returned from lines scanned before cancellation.
+		assert.NotNil(t, matches)
+		assert.NotEmpty(t, matches, "should return partial matches from scanned lines")
 	case <-time.After(5 * time.Second):
 		t.Fatal("searchFile did not return after context cancellation")
 	}
