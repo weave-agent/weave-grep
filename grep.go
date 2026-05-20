@@ -67,7 +67,7 @@ func init() {
 		})
 	})
 
-	sdk.RegisterTool[struct{}]("grep", func(cfg sdk.Config, _ sdk.PreferenceReader, _ struct{}) (sdk.Tool, error) {
+	sdk.RegisterTool("grep", func(cfg sdk.Config, _ sdk.PreferenceReader, _ struct{}) (sdk.Tool, error) {
 		return &tool{cfg: cfg}, nil
 	})
 }
@@ -360,7 +360,8 @@ func searchWithRipgrep(ctx context.Context, rgPath, absPath string, isDir bool, 
 	for scanner.Scan() {
 		if ctx.Err() != nil {
 			_ = cmd.Process.Kill()
-			return nil, ctx.Err()
+
+			return matches, nil //nolint:nilerr // return partial matches on cancellation
 		}
 
 		match := parseRgLine(scanner.Bytes(), searchPath, include, respectGitignore)
@@ -375,19 +376,22 @@ func searchWithRipgrep(ctx context.Context, rgPath, absPath string, isDir bool, 
 	if err := scanner.Err(); err != nil {
 		_ = cmd.Wait()
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return matches, nil //nolint:nilerr // return partial matches on cancellation
 		}
+
 		return nil, fmt.Errorf("parsing rg output: %w", err)
 	}
 
 	if err := cmd.Wait(); err != nil {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return matches, nil //nolint:nilerr // return partial matches on cancellation
 		}
+
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
 			return matches, nil
 		}
+
 		return nil, fmt.Errorf("rg: %w", err)
 	}
 
@@ -477,7 +481,7 @@ func searchDir(ctx context.Context, root string, re *regexp.Regexp, contextLines
 	})
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, nil
+			return matches, nil //nolint:nilerr // return partial matches on cancellation
 		}
 
 		return nil, fmt.Errorf("grep: walk directory: %w", err)
@@ -540,16 +544,14 @@ func searchFile(ctx context.Context, displayPath, filePath string, re *regexp.Re
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 
-	lineCount := 0
 	for scanner.Scan() {
-		lineCount++
-		if lineCount%100 == 0 && ctx.Err() != nil {
-			return nil
-		}
 		lines = append(lines, scanner.Text())
+		if ctx.Err() != nil {
+			break
+		}
 	}
 
-	if err := scanner.Err(); err != nil {
+	if err := scanner.Err(); err != nil && ctx.Err() == nil {
 		return nil
 	}
 
