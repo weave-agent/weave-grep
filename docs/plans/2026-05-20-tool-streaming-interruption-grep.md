@@ -15,12 +15,12 @@ Add streaming progress to the grep tool so the TUI shows partial results while s
 ## Implementation Steps
 
 ### Task 1: Add context to stdlib search path
-- [ ] Change `searchWithStdlib` signature to accept `ctx context.Context`
-- [ ] Add `ctx.Err()` check in the file walk loop (between files)
-- [ ] Add `ctx.Err()` check in the line scan loop (periodic, every N lines)
-- [ ] Return early with empty results if context is canceled
-- [ ] Write tests: stdlib search cancels mid-execution
-- [ ] Run extension tests — must pass
+- [x] Change `searchWithStdlib` signature to accept `ctx context.Context`
+- [x] Add `ctx.Err()` check in the file walk loop (between files)
+- [x] Add `ctx.Err()` check in the line scan loop (periodic, every N lines)
+- [x] Return early with empty results if context is canceled
+- [x] Write tests: stdlib search cancels mid-execution
+- [x] Run extension tests — must pass
 
 ### Task 2: Add streaming progress via bus events
 - [ ] Collect matches in a slice with mutex protection

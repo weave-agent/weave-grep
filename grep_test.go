@@ -2,11 +2,14 @@ package grep
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/weave-agent/weave/sdk"
 
@@ -412,6 +415,88 @@ func (ts *testSandboxer) AllowRead(path string) bool {
 
 func (ts *testSandboxer) Mode() string   { return "auto" }
 func (ts *testSandboxer) SetMode(string) {}
+
+func TestSearchWithStdlibContextCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "a.txt"), []byte("findme"), 0o644))
+
+	matches := searchWithStdlib(ctx, dir, true, "findme", "", false, false, 0, true)
+	assert.Nil(t, matches)
+}
+
+func TestSearchDirContextCanceled(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "a.txt"), []byte("findme"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "b.txt"), []byte("findme"), 0o644))
+
+	re := regexp.MustCompile("findme")
+
+	// Cancel before starting
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	matches, err := searchDir(ctx, dir, re, 0, "", true)
+	require.NoError(t, err)
+	assert.Nil(t, matches)
+}
+
+func TestSearchFileContextCanceled(t *testing.T) {
+	content := "line1\nline2\nline3\n"
+	path := createTempFile(t, content)
+
+	re := regexp.MustCompile("line")
+
+	// Cancel before starting
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	matches := searchFile(ctx, "test.txt", path, re, 0)
+	assert.Nil(t, matches)
+}
+
+func TestSearchFileContextCanceledMidScan(t *testing.T) {
+	// Create a large file so scanning takes long enough for cancel to fire.
+	var lines []string
+	for i := range 300000 {
+		lines = append(lines, fmt.Sprintf("line %d with findme target content to make lines longer", i))
+	}
+	content := strings.Join(lines, "\n")
+	path := createTempFile(t, content)
+
+	re := regexp.MustCompile("findme")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	matches := searchFile(ctx, "test.txt", path, re, 0)
+	assert.Nil(t, matches, "expected nil when context canceled during scan")
+}
+
+func TestSearchDirContextCanceledMidWalk(t *testing.T) {
+	dir := t.TempDir()
+	// Create many files so walk takes time
+	for i := range 5000 {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, fmt.Sprintf("file%04d.txt", i)), []byte("findme content here"), 0o644))
+	}
+
+	re := regexp.MustCompile("findme")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	matches, err := searchDir(ctx, dir, re, 0, "", true)
+	require.NoError(t, err)
+	assert.Nil(t, matches, "expected nil when context canceled during walk")
+}
 
 func TestRgWithSandboxerFiltersDeniedPaths(t *testing.T) {
 	if _, err := exec.LookPath("rg"); err != nil {

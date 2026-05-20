@@ -199,10 +199,14 @@ func (t *tool) search(ctx context.Context, absPath string, isDir bool, pattern, 
 		}
 	}
 
-	return searchWithStdlib(absPath, isDir, pattern, include, ignoreCase, literal, contextLines, respectGitignore)
+	return searchWithStdlib(ctx, absPath, isDir, pattern, include, ignoreCase, literal, contextLines, respectGitignore)
 }
 
-func searchWithStdlib(absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool) []string {
+func searchWithStdlib(ctx context.Context, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool) []string {
+	if ctx.Err() != nil {
+		return nil
+	}
+
 	expr := pattern
 	if literal {
 		expr = regexp.QuoteMeta(pattern)
@@ -218,7 +222,7 @@ func searchWithStdlib(absPath string, isDir bool, pattern, include string, ignor
 	}
 
 	if isDir {
-		matches, dirErr := searchDir(absPath, re, contextLines, include, respectGitignore)
+		matches, dirErr := searchDir(ctx, absPath, re, contextLines, include, respectGitignore)
 		if dirErr != nil {
 			return nil
 		}
@@ -230,7 +234,7 @@ func searchWithStdlib(absPath string, isDir bool, pattern, include string, ignor
 		return nil
 	}
 
-	return searchFile(filepath.Base(absPath), absPath, re, contextLines)
+	return searchFile(ctx, filepath.Base(absPath), absPath, re, contextLines)
 }
 
 func searchWithRipgrep(ctx context.Context, rgPath, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool) ([]string, error) {
@@ -342,10 +346,14 @@ func parseRgJSON(data []byte, baseDir, include string, respectGitignore bool) ([
 	return matches, nil
 }
 
-func searchDir(root string, re *regexp.Regexp, contextLines int, include string, respectGitignore bool) ([]string, error) {
+func searchDir(ctx context.Context, root string, re *regexp.Regexp, contextLines int, include string, respectGitignore bool) ([]string, error) {
 	var matches []string
 
 	err := filepath.WalkDir(root, func(walkPath string, d fs.DirEntry, walkErr error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
 		if walkErr != nil {
 			return nil //nolint:nilerr // walkErr intentionally swallowed to skip inaccessible entries
 		}
@@ -368,12 +376,16 @@ func searchDir(root string, re *regexp.Regexp, contextLines int, include string,
 		}
 
 		relPath, _ := filepath.Rel(root, walkPath)
-		fileMatches := searchFile(relPath, walkPath, re, contextLines)
+		fileMatches := searchFile(ctx, relPath, walkPath, re, contextLines)
 		matches = append(matches, fileMatches...)
 
 		return nil
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, nil
+		}
+
 		return nil, fmt.Errorf("grep: walk directory: %w", err)
 	}
 
@@ -409,7 +421,11 @@ func fileMatchesInclude(include, name string) bool {
 	return false
 }
 
-func searchFile(displayPath, filePath string, re *regexp.Regexp, contextLines int) []string {
+func searchFile(ctx context.Context, displayPath, filePath string, re *regexp.Regexp, contextLines int) []string {
+	if ctx.Err() != nil {
+		return nil
+	}
+
 	fi, err := os.Stat(filePath)
 	if err != nil || fi.Size() > 10*1024*1024 {
 		return nil
@@ -430,7 +446,12 @@ func searchFile(displayPath, filePath string, re *regexp.Regexp, contextLines in
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 
+	lineCount := 0
 	for scanner.Scan() {
+		lineCount++
+		if lineCount%100 == 0 && ctx.Err() != nil {
+			return nil
+		}
 		lines = append(lines, scanner.Text())
 	}
 
