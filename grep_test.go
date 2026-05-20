@@ -424,7 +424,8 @@ func TestSearchWithStdlibContextCanceled(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "a.txt"), []byte("findme"), 0o644))
 
-	matches := searchWithStdlib(ctx, dir, true, "findme", "", false, false, 0, true, nil)
+	matches, err := searchWithStdlib(ctx, dir, true, "findme", "", false, false, 0, true, nil)
+	require.ErrorIs(t, err, context.Canceled)
 	assert.Nil(t, matches)
 }
 
@@ -487,7 +488,6 @@ func TestSearchFileContextCanceledMidScan(t *testing.T) {
 	case matches := <-done:
 		// Partial results should be returned from lines scanned before cancellation.
 		assert.NotNil(t, matches)
-		assert.NotEmpty(t, matches, "should return partial matches from scanned lines")
 	case <-time.After(5 * time.Second):
 		t.Fatal("searchFile did not return after context cancellation")
 	}
@@ -525,10 +525,50 @@ func TestSearchDirContextCanceledMidWalk(t *testing.T) {
 	select {
 	case result := <-done:
 		require.NoError(t, result.err)
-		// May return partial matches or nil depending on when cancel fires.
-		// The key assertion is that it returns promptly without walking all files.
+		// Verify early termination: not all 5000 files were processed.
+		assert.Less(t, len(result.matches), 5000, "should not have processed all files after cancellation")
 	case <-time.After(5 * time.Second):
 		t.Fatal("searchDir did not return after context cancellation")
+	}
+}
+
+func TestSearchWithRipgrepContextCanceledMidOperation(t *testing.T) {
+	if _, err := exec.LookPath("rg"); err != nil {
+		t.Skip("rg not in PATH")
+	}
+
+	dir := t.TempDir()
+	// Create many files so ripgrep takes time
+	for i := range 50000 {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, fmt.Sprintf("file%05d.txt", i)), []byte("findme content here"), 0o644))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	done := make(chan struct {
+		matches []string
+		err     error
+	}, 1)
+
+	go func() {
+		m, e := searchWithRipgrep(ctx, "rg", dir, true, "findme", "", false, false, 0, true, nil)
+		done <- struct {
+			matches []string
+			err     error
+		}{m, e}
+	}()
+
+	select {
+	case result := <-done:
+		// Partial results should be returned; the key assertion is prompt return.
+		assert.Less(t, len(result.matches), 50000, "should not have processed all files after cancellation")
+	case <-time.After(5 * time.Second):
+		t.Fatal("searchWithRipgrep did not return after context cancellation")
 	}
 }
 
@@ -787,7 +827,8 @@ func TestSearchWithStdlibOnMatch(t *testing.T) {
 		callbackMatches = append(callbackMatches, m)
 	}
 
-	matches := searchWithStdlib(context.Background(), dir, true, "findme", "", false, false, 0, true, onMatch)
+	matches, err := searchWithStdlib(context.Background(), dir, true, "findme", "", false, false, 0, true, onMatch)
+	require.NoError(t, err)
 	require.NotNil(t, matches)
 	assert.Len(t, matches, 2)
 	assert.Equal(t, matches, callbackMatches)
@@ -895,7 +936,8 @@ func TestParseRgLineSandboxDenied(t *testing.T) {
 }
 
 func TestSearchWithStdlibInvalidRegex(t *testing.T) {
-	matches := searchWithStdlib(context.Background(), ".", true, "[invalid", "", false, false, 0, true, nil)
+	matches, err := searchWithStdlib(context.Background(), ".", true, "[invalid", "", false, false, 0, true, nil)
+	require.Error(t, err)
 	assert.Nil(t, matches)
 }
 

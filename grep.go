@@ -212,7 +212,7 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 		collector = newProgressCollector(ctx, bus)
 	}
 
-	matches := t.search(ctx, params.absPath, params.isDir, params.pattern, params.include, params.ignoreCase, params.literal, params.contextLines, params.respectGitignore, func(file, _ string) {
+	matches, searchErr := t.search(ctx, params.absPath, params.isDir, params.pattern, params.include, params.ignoreCase, params.literal, params.contextLines, params.respectGitignore, func(file, _ string) {
 		if collector != nil {
 			collector.add(file)
 		}
@@ -221,6 +221,10 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 	// Publish final progress event
 	if collector != nil {
 		collector.publish()
+	}
+
+	if searchErr != nil {
+		return sdk.ToolResult{Content: fmt.Sprintf("error: %v", searchErr), IsError: true}, nil
 	}
 
 	if len(matches) == 0 {
@@ -295,22 +299,22 @@ func (pc *progressCollector) publish() {
 }
 
 // search tries rg first, then falls back to stdlib.
-func (t *tool) search(ctx context.Context, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, onMatch func(file, match string)) []string {
+func (t *tool) search(ctx context.Context, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, onMatch func(file, match string)) ([]string, error) {
 	// Use rg when available. Matches from denied paths are filtered by
 	// AllowRead checks in parseRgLine.
 	if rgPath := ripgrep.Find(); rgPath != "" {
 		matches, err := searchWithRipgrep(ctx, rgPath, absPath, isDir, pattern, include, ignoreCase, literal, contextLines, respectGitignore, onMatch)
 		if err == nil {
-			return matches
+			return matches, nil
 		}
 	}
 
 	return searchWithStdlib(ctx, absPath, isDir, pattern, include, ignoreCase, literal, contextLines, respectGitignore, onMatch)
 }
 
-func searchWithStdlib(ctx context.Context, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, onMatch func(file, match string)) []string {
-	if ctx.Err() != nil {
-		return nil
+func searchWithStdlib(ctx context.Context, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, onMatch func(file, match string)) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("search canceled: %w", err)
 	}
 
 	expr := pattern
@@ -324,23 +328,18 @@ func searchWithStdlib(ctx context.Context, absPath string, isDir bool, pattern, 
 
 	re, err := regexp.Compile(expr)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("compile regex: %w", err)
 	}
 
 	if isDir {
-		matches, dirErr := searchDir(ctx, absPath, re, contextLines, include, respectGitignore, onMatch)
-		if dirErr != nil {
-			return nil
-		}
-
-		return matches
+		return searchDir(ctx, absPath, re, contextLines, include, respectGitignore, onMatch)
 	}
 
 	if !fileMatchesInclude(include, filepath.Base(absPath)) {
-		return nil
+		return nil, nil
 	}
 
-	return searchFile(ctx, filepath.Base(absPath), absPath, re, contextLines, onMatch)
+	return searchFile(ctx, filepath.Base(absPath), absPath, re, contextLines, onMatch), nil
 }
 
 func searchWithRipgrep(ctx context.Context, rgPath, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, onMatch func(file, match string)) ([]string, error) {
@@ -480,7 +479,12 @@ func parseRgLine(line []byte, baseDir, include string, respectGitignore bool) (s
 	// rg outputs paths relative to its CWD (baseDir) using "/" separators
 	// regardless of OS. Ripgrep paths are already clean (no .. or . segments).
 	if filepath.IsAbs(relPath) {
-		relPath = filepath.Clean(relPath)
+		var err error
+
+		relPath, err = filepath.Rel(baseDir, relPath)
+		if err != nil {
+			return "", "", false
+		}
 	}
 
 	// Skip VCS and dependency directories (defense-in-depth for --no-ignore)
