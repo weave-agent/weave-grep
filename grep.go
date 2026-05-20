@@ -56,6 +56,7 @@ func getSandboxer() sdk.Sandboxer {
 	return s
 }
 
+//nolint:gochecknoinits // SDK requires init() for tool registration
 func init() {
 	sdk.OnBusReady(func(bus sdk.Bus) {
 		bus.On("sandbox.registered", func(ev sdk.Event) error {
@@ -112,10 +113,21 @@ func (t *tool) Definition() sdk.ToolDef {
 	}
 }
 
-func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult, error) {
+type searchParams struct {
+	pattern          string
+	absPath          string
+	isDir            bool
+	include          string
+	ignoreCase       bool
+	literal          bool
+	contextLines     int
+	respectGitignore bool
+}
+
+func (t *tool) parseSearchParams(args map[string]any) (searchParams, sdk.ToolResult) {
 	pattern, _ := args[ParamPattern].(string)
 	if pattern == "" {
-		return sdk.ToolResult{Content: "error: pattern is required", IsError: true}, nil
+		return searchParams{}, sdk.ToolResult{Content: "error: pattern is required", IsError: true}
 	}
 
 	path, _ := args[paramPath].(string)
@@ -129,7 +141,7 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 
 	if include != "" {
 		if _, matchErr := filepath.Match(include, ""); matchErr != nil {
-			return sdk.ToolResult{Content: fmt.Sprintf("error: invalid include pattern: %s", matchErr), IsError: true}, nil
+			return searchParams{}, sdk.ToolResult{Content: fmt.Sprintf("error: invalid include pattern: %s", matchErr), IsError: true}
 		}
 	}
 
@@ -143,16 +155,16 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 
 	absPath, err := filepath.Abs(path)
 	if err != nil {
-		return sdk.ToolResult{Content: fmt.Sprintf("error: %s", err), IsError: true}, nil
+		return searchParams{}, sdk.ToolResult{Content: fmt.Sprintf("error: %s", err), IsError: true}
 	}
 
 	if s := getSandboxer(); s != nil && !s.AllowRead(absPath) {
-		return sdk.ToolResult{Content: "sandbox: read denied — path is protected", IsError: true}, nil
+		return searchParams{}, sdk.ToolResult{Content: "sandbox: read denied — path is protected", IsError: true}
 	}
 
 	info, err := os.Stat(absPath)
 	if err != nil {
-		return sdk.ToolResult{Content: fmt.Sprintf("error: %s", err), IsError: true}, nil
+		return searchParams{}, sdk.ToolResult{Content: fmt.Sprintf("error: %s", err), IsError: true}
 	}
 
 	// Validate regex early so both rg and stdlib paths get consistent error handling
@@ -166,7 +178,7 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 	}
 
 	if _, compileErr := regexp.Compile(expr); compileErr != nil {
-		return sdk.ToolResult{Content: fmt.Sprintf("error: invalid pattern: %s", compileErr), IsError: true}, nil
+		return searchParams{}, sdk.ToolResult{Content: fmt.Sprintf("error: invalid pattern: %s", compileErr), IsError: true}
 	}
 
 	respectGitignore := true
@@ -174,14 +186,33 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 		respectGitignore = t.cfg.RespectGitignore()
 	}
 
+	return searchParams{
+		pattern:          pattern,
+		absPath:          absPath,
+		isDir:            info.IsDir(),
+		include:          include,
+		ignoreCase:       ignoreCase,
+		literal:          literal,
+		contextLines:     contextLines,
+		respectGitignore: respectGitignore,
+	}, sdk.ToolResult{}
+}
+
+func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult, error) {
+	params, errResult := t.parseSearchParams(args)
+	if errResult.IsError {
+		return errResult, nil
+	}
+
 	// Set up streaming progress reporter
 	bus := sdk.BusFromContext(ctx)
+
 	var collector *progressCollector
 	if bus != nil {
 		collector = newProgressCollector(ctx, bus)
 	}
 
-	matches := t.search(ctx, absPath, info.IsDir(), pattern, include, ignoreCase, literal, contextLines, respectGitignore, func(m string) {
+	matches := t.search(ctx, params.absPath, params.isDir, params.pattern, params.include, params.ignoreCase, params.literal, params.contextLines, params.respectGitignore, func(m string) {
 		if collector != nil {
 			collector.add(m)
 		}
@@ -222,16 +253,25 @@ func newProgressCollector(ctx context.Context, bus sdk.Bus) *progressCollector {
 			pc.publish()
 		}, 200*time.Millisecond)
 	}
+
 	return pc
 }
 
 func (pc *progressCollector) add(match string) {
 	pc.mu.Lock()
 	pc.matchCount++
-	if idx := strings.Index(match, ":"); idx > 0 {
-		pc.currentFile = match[:idx]
+
+	// Match format is path:line:content. Find the colon before the line number
+	// to extract the file path. On Windows, absolute paths contain colons
+	// (e.g. C:\dir\file.go), so we find the last two colons.
+	if lastColon := strings.LastIndex(match, ":"); lastColon > 0 {
+		if prevColon := strings.LastIndex(match[:lastColon], ":"); prevColon > 0 {
+			pc.currentFile = match[:prevColon]
+		}
 	}
+
 	pc.mu.Unlock()
+
 	if pc.throttle != nil {
 		pc.throttle()
 	}
@@ -251,6 +291,7 @@ func (pc *progressCollector) publish() {
 	if file != "" {
 		content += " in " + file
 	}
+
 	content += "..."
 
 	pc.bus.Publish(sdk.NewEvent(sdk.TopicToolProgress, sdk.ToolProgress{
@@ -309,6 +350,65 @@ func searchWithStdlib(ctx context.Context, absPath string, isDir bool, pattern, 
 }
 
 func searchWithRipgrep(ctx context.Context, rgPath, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, onMatch func(string)) ([]string, error) {
+	args, searchPath := buildRgArgs(absPath, isDir, pattern, ignoreCase, literal, contextLines, respectGitignore)
+
+	cmd := exec.CommandContext(ctx, rgPath, args...)
+	cmd.Dir = searchPath
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("rg stdout pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		_ = stdout.Close()
+
+		return nil, fmt.Errorf("rg start: %w", err)
+	}
+
+	var matches []string
+
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+
+	for scanner.Scan() {
+		if ctx.Err() != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+
+			return matches, nil //nolint:nilerr // return partial matches on cancellation
+		}
+
+		match, isMatch := parseRgLine(scanner.Bytes(), searchPath, include, respectGitignore)
+		if match != "" {
+			matches = append(matches, match)
+			if onMatch != nil && isMatch {
+				onMatch(match)
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return handleRgScannerErr(ctx, cmd, err, matches)
+	}
+
+	if err := cmd.Wait(); err != nil {
+		if ctx.Err() != nil {
+			return matches, nil //nolint:nilerr // return partial matches on cancellation
+		}
+
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return matches, nil
+		}
+
+		return nil, fmt.Errorf("rg: %w", err)
+	}
+
+	return matches, nil
+}
+
+func buildRgArgs(absPath string, isDir bool, pattern string, ignoreCase, literal bool, contextLines int, respectGitignore bool) ([]string, string) {
 	args := []string{"--json", "-H", "-n", "--hidden"}
 
 	if ignoreCase {
@@ -318,9 +418,6 @@ func searchWithRipgrep(ctx context.Context, rgPath, absPath string, isDir bool, 
 	if literal {
 		args = append(args, "-F")
 	}
-
-	// Do not pass --glob to rg — it overrides gitignore logic.
-	// Instead, filter include in Go after parsing rg output.
 
 	if !respectGitignore {
 		args = append(args, "--no-ignore")
@@ -340,66 +437,29 @@ func searchWithRipgrep(ctx context.Context, rgPath, absPath string, isDir bool, 
 		args = append(args, ".")
 	}
 
-	cmd := exec.CommandContext(ctx, rgPath, args...)
-	cmd.Dir = searchPath
+	return args, searchPath
+}
 
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("rg stdout pipe: %w", err)
-	}
-
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("rg start: %w", err)
-	}
-
-	var matches []string
-
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
-
-	for scanner.Scan() {
-		if ctx.Err() != nil {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-
-			return matches, nil //nolint:nilerr // return partial matches on cancellation
-		}
-
-		match := parseRgLine(scanner.Bytes(), searchPath, include, respectGitignore)
-		if match != "" {
-			matches = append(matches, match)
-			if onMatch != nil {
-				onMatch(match)
-			}
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		_ = cmd.Wait()
-		if ctx.Err() != nil {
-			return matches, nil //nolint:nilerr // return partial matches on cancellation
-		}
-
-		return nil, fmt.Errorf("parsing rg output: %w", err)
-	}
-
-	if err := cmd.Wait(); err != nil {
+func handleRgScannerErr(ctx context.Context, cmd *exec.Cmd, scanErr error, matches []string) ([]string, error) {
+	if werr := cmd.Wait(); werr != nil {
 		if ctx.Err() != nil {
 			return matches, nil //nolint:nilerr // return partial matches on cancellation
 		}
 
 		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		if errors.As(werr, &exitErr) && exitErr.ExitCode() == 1 {
 			return matches, nil
 		}
-
-		return nil, fmt.Errorf("rg: %w", err)
 	}
 
-	return matches, nil
+	if ctx.Err() != nil {
+		return matches, nil //nolint:nilerr // return partial matches on cancellation
+	}
+
+	return nil, fmt.Errorf("parsing rg output: %w", scanErr)
 }
 
-func parseRgLine(line []byte, baseDir, include string, respectGitignore bool) string {
+func parseRgLine(line []byte, baseDir, include string, respectGitignore bool) (string, bool) {
 	var entry struct {
 		Type string `json:"type"`
 		Data struct {
@@ -414,35 +474,37 @@ func parseRgLine(line []byte, baseDir, include string, respectGitignore bool) st
 	}
 
 	if err := json.Unmarshal(line, &entry); err != nil {
-		return ""
+		return "", false
 	}
 
 	if entry.Type != "match" && entry.Type != "context" {
-		return ""
+		return "", false
 	}
 
 	relPath := entry.Data.Path.Text
 
-	// rg outputs paths relative to its CWD (baseDir), so clean directly
-	if !filepath.IsAbs(relPath) {
+	// rg outputs paths relative to its CWD (baseDir) using "/" separators
+	// regardless of OS. Ripgrep paths are already clean (no .. or . segments).
+	if filepath.IsAbs(relPath) {
 		relPath = filepath.Clean(relPath)
 	}
 
-	// Skip VCS and dependency directories (matches stdlib isSkipDir behavior)
+	// Skip VCS and dependency directories (defense-in-depth for --no-ignore)
 	if respectGitignore && isSkipPath(relPath) {
-		return ""
+		return "", false
 	}
 
 	if s := getSandboxer(); s != nil && !s.AllowRead(filepath.Join(baseDir, relPath)) {
-		return ""
+		return "", false
 	}
 
 	if !fileMatchesInclude(include, filepath.Base(relPath)) {
-		return ""
+		return "", false
 	}
 
 	content := strings.TrimRight(entry.Data.Lines.Text, "\n\r")
-	return fmt.Sprintf("%s:%d:%s", relPath, entry.Data.LineNumber, content)
+
+	return fmt.Sprintf("%s:%d:%s", relPath, entry.Data.LineNumber, content), entry.Type == "match"
 }
 
 func searchDir(ctx context.Context, root string, re *regexp.Regexp, contextLines int, include string, respectGitignore bool, onMatch func(string)) ([]string, error) {
@@ -547,12 +609,17 @@ func searchFile(ctx context.Context, displayPath, filePath string, re *regexp.Re
 
 	for scanner.Scan() {
 		lines = append(lines, scanner.Text())
+
 		if ctx.Err() != nil {
 			break
 		}
 	}
 
 	if err := scanner.Err(); err != nil && ctx.Err() == nil {
+		return nil
+	}
+
+	if ctx.Err() != nil {
 		return nil
 	}
 
@@ -572,7 +639,8 @@ func searchFile(ctx context.Context, displayPath, filePath string, re *regexp.Re
 		if matched[i] {
 			result := fmt.Sprintf("%s:%d:%s", displayPath, i+1, lines[i])
 			results = append(results, result)
-			if onMatch != nil {
+
+			if onMatch != nil && re.MatchString(lines[i]) {
 				onMatch(result)
 			}
 		}

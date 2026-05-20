@@ -464,6 +464,7 @@ func TestSearchFileContextCanceledMidScan(t *testing.T) {
 	for i := range 300000 {
 		lines = append(lines, fmt.Sprintf("line %d with findme target content to make lines longer", i))
 	}
+
 	content := strings.Join(lines, "\n")
 	path := createTempFile(t, content)
 
@@ -539,6 +540,7 @@ type mockBus struct {
 func (m *mockBus) Publish(e sdk.Event) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	m.events = append(m.events, e)
 }
 
@@ -552,11 +554,13 @@ func (m *mockBus) progressEvents() []sdk.Event {
 	defer m.mu.Unlock()
 
 	var out []sdk.Event
+
 	for _, e := range m.events {
 		if e.Topic == sdk.TopicToolProgress {
 			out = append(out, e)
 		}
 	}
+
 	return out
 }
 
@@ -778,6 +782,7 @@ func TestSearchWithStdlibOnMatch(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "b.txt"), []byte("findme in b"), 0o644))
 
 	var callbackMatches []string
+
 	onMatch := func(m string) {
 		callbackMatches = append(callbackMatches, m)
 	}
@@ -794,6 +799,7 @@ func TestSearchFileOnMatch(t *testing.T) {
 	re := regexp.MustCompile("findme")
 
 	var callbackMatches []string
+
 	onMatch := func(m string) {
 		callbackMatches = append(callbackMatches, m)
 	}
@@ -810,13 +816,16 @@ func TestSearchFileOnMatchWithContextLines(t *testing.T) {
 	re := regexp.MustCompile("MATCH")
 
 	var callbackMatches []string
+
 	onMatch := func(m string) {
 		callbackMatches = append(callbackMatches, m)
 	}
 
 	matches := searchFile(context.Background(), "test.txt", path, re, 1, onMatch)
 	require.Len(t, matches, 3)
-	assert.Equal(t, matches, callbackMatches)
+	// onMatch is only called for actual matches, not context lines.
+	require.Len(t, callbackMatches, 1)
+	assert.Contains(t, callbackMatches[0], "MATCH")
 }
 
 func TestParseRgLine(t *testing.T) {
@@ -865,7 +874,7 @@ func TestParseRgLine(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := parseRgLine([]byte(tt.line), baseDir, tt.include, tt.respectGitignore)
+			got, _ := parseRgLine([]byte(tt.line), baseDir, tt.include, tt.respectGitignore)
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -881,7 +890,7 @@ func TestParseRgLineSandboxDenied(t *testing.T) {
 	t.Cleanup(func() { setSandboxer(nil) })
 
 	line := `{"type":"match","data":{"path":{"text":"secret.txt"},"line_number":1,"lines":{"text":"findme secret"}}}`
-	got := parseRgLine([]byte(line), dir, "", true)
+	got, _ := parseRgLine([]byte(line), dir, "", true)
 	assert.Empty(t, got)
 }
 
