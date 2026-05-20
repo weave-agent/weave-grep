@@ -23,12 +23,12 @@ Add streaming progress to the grep tool so the TUI shows partial results while s
 - [x] Run extension tests — must pass
 
 ### Task 2: Add streaming progress via bus events
-- [ ] Collect matches in a slice with mutex protection
-- [ ] Use `sdk.Throttle` (from core SDK) to publish `tool.progress` events
-- [ ] Event content: "Found N matches in <path>..." or truncated preview
-- [ ] Throttle interval: 200ms
-- [ ] Write tests: verify bus events are published, throttled, and contain correct match counts
-- [ ] Run extension tests — must pass
+- [x] Collect matches in a slice with mutex protection
+- [x] Use `sdk.Throttle` (from core SDK) to publish `tool.progress` events
+- [x] Event content: "Found N matches in <path>..." or truncated preview
+- [x] Throttle interval: 200ms
+- [x] Write tests: verify bus events are published, throttled, and contain correct match counts
+- [x] Run extension tests — must pass
 
 ### Task 3: Verify integration
 - [ ] Run `go test ./...` in grep extension dir

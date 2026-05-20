@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -423,7 +424,7 @@ func TestSearchWithStdlibContextCanceled(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "a.txt"), []byte("findme"), 0o644))
 
-	matches := searchWithStdlib(ctx, dir, true, "findme", "", false, false, 0, true)
+	matches := searchWithStdlib(ctx, dir, true, "findme", "", false, false, 0, true, nil)
 	assert.Nil(t, matches)
 }
 
@@ -438,7 +439,7 @@ func TestSearchDirContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	matches, err := searchDir(ctx, dir, re, 0, "", true)
+	matches, err := searchDir(ctx, dir, re, 0, "", true, nil)
 	require.NoError(t, err)
 	assert.Nil(t, matches)
 }
@@ -453,7 +454,7 @@ func TestSearchFileContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	matches := searchFile(ctx, "test.txt", path, re, 0)
+	matches := searchFile(ctx, "test.txt", path, re, 0, nil)
 	assert.Nil(t, matches)
 }
 
@@ -474,7 +475,7 @@ func TestSearchFileContextCanceledMidScan(t *testing.T) {
 		cancel()
 	}()
 
-	matches := searchFile(ctx, "test.txt", path, re, 0)
+	matches := searchFile(ctx, "test.txt", path, re, 0, nil)
 	assert.Nil(t, matches, "expected nil when context canceled during scan")
 }
 
@@ -493,9 +494,110 @@ func TestSearchDirContextCanceledMidWalk(t *testing.T) {
 		cancel()
 	}()
 
-	matches, err := searchDir(ctx, dir, re, 0, "", true)
+	matches, err := searchDir(ctx, dir, re, 0, "", true, nil)
 	require.NoError(t, err)
 	assert.Nil(t, matches, "expected nil when context canceled during walk")
+}
+
+type mockBus struct {
+	mu     sync.Mutex
+	events []sdk.Event
+}
+
+func (m *mockBus) Publish(e sdk.Event) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.events = append(m.events, e)
+}
+
+func (m *mockBus) On(topic string, h sdk.Handler) {}
+func (m *mockBus) OnAll(h sdk.Handler)            {}
+func (m *mockBus) Off(h sdk.Handler)              {}
+func (m *mockBus) Close() error                   { return nil }
+
+func (m *mockBus) progressEvents() []sdk.Event {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var out []sdk.Event
+	for _, e := range m.events {
+		if e.Topic == sdk.TopicToolProgress {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func TestExecutePublishesProgressEvents(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "a.txt"), []byte("findme in a"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "b.txt"), []byte("findme in b"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "c.txt"), []byte("findme in c"), 0o644))
+
+	bus := &mockBus{}
+	ctx := sdk.WithBus(context.Background(), bus)
+
+	result, err := (&tool{}).Execute(ctx, map[string]any{
+		"pattern": "findme",
+		"path":    dir,
+	})
+	require.NoError(t, err)
+	assert.False(t, result.IsError)
+
+	progressEvents := bus.progressEvents()
+	assert.NotEmpty(t, progressEvents, "should have published progress events")
+
+	lastEvent := progressEvents[len(progressEvents)-1]
+	payload, ok := lastEvent.Payload.(sdk.ToolProgress)
+	require.True(t, ok)
+	assert.Contains(t, payload.Content, "3")
+	assert.Equal(t, "grep", payload.ToolName)
+}
+
+func TestExecuteThrottlesProgressEvents(t *testing.T) {
+	dir := t.TempDir()
+	for i := range 500 {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, fmt.Sprintf("file%03d.txt", i)), []byte("findme content here"), 0o644))
+	}
+
+	bus := &mockBus{}
+	ctx := sdk.WithBus(context.Background(), bus)
+
+	_, err := (&tool{}).Execute(ctx, map[string]any{
+		"pattern": "findme",
+		"path":    dir,
+	})
+	require.NoError(t, err)
+
+	progressEvents := bus.progressEvents()
+
+	assert.GreaterOrEqual(t, len(progressEvents), 1, "should publish at least one progress event")
+	assert.Less(t, len(progressEvents), 100, "events should be throttled, not one per match")
+}
+
+func TestExecuteProgressEventContent(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "hello.go"), []byte("findme in go"), 0o644))
+
+	bus := &mockBus{}
+	ctx := sdk.WithBus(context.Background(), bus)
+
+	_, err := (&tool{}).Execute(ctx, map[string]any{
+		"pattern": "findme",
+		"path":    dir,
+	})
+	require.NoError(t, err)
+
+	progressEvents := bus.progressEvents()
+	require.NotEmpty(t, progressEvents)
+
+	for _, e := range progressEvents {
+		payload, ok := e.Payload.(sdk.ToolProgress)
+		require.True(t, ok)
+		assert.Equal(t, "grep", payload.ToolName)
+		assert.Contains(t, payload.Content, "Found")
+		assert.Contains(t, payload.Content, "matches")
+	}
 }
 
 func TestRgWithSandboxerFiltersDeniedPaths(t *testing.T) {
