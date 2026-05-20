@@ -224,7 +224,7 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 	// with any pending async publish).
 	if collector != nil {
 		collector.cancel()
-		collector.publish()
+		collector.publish(true)
 	}
 
 	if searchErr != nil {
@@ -261,7 +261,7 @@ func newProgressCollector(ctx context.Context, bus sdk.Bus) *progressCollector {
 		throttleCtx, cancel := context.WithCancel(ctx)
 		pc.cancel = cancel
 		pc.throttle = sdk.Throttle(throttleCtx, func() {
-			pc.publish()
+			pc.publish(false)
 		}, 200*time.Millisecond)
 	}
 
@@ -282,7 +282,7 @@ func (pc *progressCollector) add(file string) {
 	}
 }
 
-func (pc *progressCollector) publish() {
+func (pc *progressCollector) publish(final bool) {
 	pc.mu.Lock()
 	count := pc.matchCount
 	file := pc.currentFile
@@ -297,7 +297,9 @@ func (pc *progressCollector) publish() {
 		content += " in " + file
 	}
 
-	content += "..."
+	if !final {
+		content += "..."
+	}
 
 	pc.bus.Publish(sdk.NewEvent(sdk.TopicToolProgress, sdk.ToolProgress{
 		ToolName: "grep",
@@ -563,7 +565,7 @@ func searchDir(ctx context.Context, root string, re *regexp.Regexp, contextLines
 			return matches, nil //nolint:nilerr // return partial matches on cancellation
 		}
 
-		return nil, fmt.Errorf("grep: walk directory: %w", err)
+		return matches, fmt.Errorf("grep: walk directory: %w", err)
 	}
 
 	return matches, nil

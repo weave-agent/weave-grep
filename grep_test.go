@@ -739,7 +739,7 @@ func TestProgressCollector(t *testing.T) {
 	pc.add("file.go")
 	pc.add("other.go")
 
-	pc.publish()
+	pc.publish(false)
 
 	events := bus.progressEvents()
 	require.Len(t, events, 1)
@@ -756,7 +756,7 @@ func TestProgressCollectorCurrentFileEdgeCases(t *testing.T) {
 
 	// Normal case: file path is set correctly
 	pc.add("file.go")
-	pc.publish()
+	pc.publish(false)
 
 	events := bus.progressEvents()
 	require.Len(t, events, 1)
@@ -769,20 +769,7 @@ func TestProgressCollectorCurrentFileEdgeCases(t *testing.T) {
 	// Empty file path: currentFile should remain empty
 	pc = &progressCollector{bus: bus}
 	pc.add("")
-	pc.publish()
-
-	events = bus.progressEvents()
-	require.Len(t, events, 1)
-	payload = events[0].Payload.(sdk.ToolProgress)
-	assert.NotContains(t, payload.Content, " in ")
-
-	// Reset
-	bus.events = nil
-
-	// Empty file path: currentFile should remain empty
-	pc = &progressCollector{bus: bus}
-	pc.add("")
-	pc.publish()
+	pc.publish(false)
 
 	events = bus.progressEvents()
 	require.Len(t, events, 1)
@@ -795,7 +782,7 @@ func TestProgressCollectorPublishZeroMatches(t *testing.T) {
 	ctx := sdk.WithBus(context.Background(), bus)
 	pc := newProgressCollector(ctx, bus)
 
-	pc.publish()
+	pc.publish(false)
 
 	assert.Empty(t, bus.progressEvents(), "should not publish event with zero matches")
 }
@@ -807,7 +794,7 @@ func TestNewProgressCollectorNilBus(t *testing.T) {
 
 	// add and publish should be no-ops without panicking.
 	pc.add("test.go")
-	pc.publish()
+	pc.publish(false)
 }
 
 func TestSearchWithStdlibOnMatch(t *testing.T) {
