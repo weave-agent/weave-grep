@@ -347,6 +347,10 @@ func searchWithStdlib(ctx context.Context, absPath string, isDir bool, pattern, 
 }
 
 func searchWithRipgrep(ctx context.Context, rgPath, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, onMatch func(file, match string)) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil //nolint:nilerr // return partial matches on cancellation
+	}
+
 	args, searchPath := buildRgArgs(absPath, isDir, pattern, ignoreCase, literal, contextLines, respectGitignore)
 
 	cmd := exec.CommandContext(ctx, rgPath, args...)
@@ -631,6 +635,10 @@ func searchFile(ctx context.Context, displayPath, filePath string, re *regexp.Re
 	isMatch := make(map[int]bool)
 
 	for i, line := range lines {
+		if i%100 == 0 && ctx.Err() != nil {
+			break
+		}
+
 		if re.MatchString(line) {
 			isMatch[i] = true
 			for j := max(0, i-contextLines); j <= min(len(lines)-1, i+contextLines); j++ {
