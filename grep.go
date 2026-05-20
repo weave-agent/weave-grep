@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"os"
@@ -219,8 +220,10 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 		}
 	})
 
-	// Publish final progress event
+	// Publish final progress event (cancel throttle first to prevent race
+	// with any pending async publish).
 	if collector != nil {
+		collector.cancel()
 		collector.publish()
 	}
 
@@ -355,6 +358,7 @@ func searchWithRipgrep(ctx context.Context, rgPath, absPath string, isDir bool, 
 
 	cmd := exec.CommandContext(ctx, rgPath, args...)
 	cmd.Dir = searchPath
+	cmd.Stderr = io.Discard
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -497,6 +501,8 @@ func parseRgLine(line []byte, baseDir, include string, respectGitignore bool) (s
 		if err != nil {
 			return "", "", false
 		}
+
+		relPath = filepath.ToSlash(relPath)
 	}
 
 	// Skip VCS and dependency directories (defense-in-depth for --no-ignore)
@@ -618,11 +624,11 @@ func searchFile(ctx context.Context, displayPath, filePath string, re *regexp.Re
 	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 
 	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-
 		if ctx.Err() != nil {
 			break
 		}
+
+		lines = append(lines, scanner.Text())
 	}
 
 	if err := scanner.Err(); err != nil && ctx.Err() == nil {
@@ -635,7 +641,7 @@ func searchFile(ctx context.Context, displayPath, filePath string, re *regexp.Re
 	isMatch := make(map[int]bool)
 
 	for i, line := range lines {
-		if i%100 == 0 && ctx.Err() != nil {
+		if ctx.Err() != nil {
 			break
 		}
 
