@@ -212,9 +212,9 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 		collector = newProgressCollector(ctx, bus)
 	}
 
-	matches := t.search(ctx, params.absPath, params.isDir, params.pattern, params.include, params.ignoreCase, params.literal, params.contextLines, params.respectGitignore, func(m string) {
+	matches := t.search(ctx, params.absPath, params.isDir, params.pattern, params.include, params.ignoreCase, params.literal, params.contextLines, params.respectGitignore, func(file, _ string) {
 		if collector != nil {
-			collector.add(m)
+			collector.add(file)
 		}
 	})
 
@@ -257,26 +257,13 @@ func newProgressCollector(ctx context.Context, bus sdk.Bus) *progressCollector {
 	return pc
 }
 
-func (pc *progressCollector) add(match string) {
+func (pc *progressCollector) add(file string) {
 	pc.mu.Lock()
 	pc.matchCount++
 
-	// Match format is path:line:content. Find the first :digits: segment
-	// to extract the file path. The line number is always digits only.
-	for i := range len(match) {
-		if match[i] == ':' {
-			j := i + 1
-			for j < len(match) && match[j] >= '0' && match[j] <= '9' {
-				j++
-			}
-
-			if j > i+1 && j < len(match) && match[j] == ':' {
-				pc.currentFile = match[:i]
-				break
-			}
-		}
+	if file != "" {
+		pc.currentFile = file
 	}
-
 	pc.mu.Unlock()
 
 	if pc.throttle != nil {
@@ -308,7 +295,7 @@ func (pc *progressCollector) publish() {
 }
 
 // search tries rg first, then falls back to stdlib.
-func (t *tool) search(ctx context.Context, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, onMatch func(string)) []string {
+func (t *tool) search(ctx context.Context, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, onMatch func(file, match string)) []string {
 	// Use rg when available. Matches from denied paths are filtered by
 	// AllowRead checks in parseRgLine.
 	if rgPath := ripgrep.Find(); rgPath != "" {
@@ -321,7 +308,7 @@ func (t *tool) search(ctx context.Context, absPath string, isDir bool, pattern, 
 	return searchWithStdlib(ctx, absPath, isDir, pattern, include, ignoreCase, literal, contextLines, respectGitignore, onMatch)
 }
 
-func searchWithStdlib(ctx context.Context, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, onMatch func(string)) []string {
+func searchWithStdlib(ctx context.Context, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, onMatch func(file, match string)) []string {
 	if ctx.Err() != nil {
 		return nil
 	}
@@ -356,7 +343,7 @@ func searchWithStdlib(ctx context.Context, absPath string, isDir bool, pattern, 
 	return searchFile(ctx, filepath.Base(absPath), absPath, re, contextLines, onMatch)
 }
 
-func searchWithRipgrep(ctx context.Context, rgPath, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, onMatch func(string)) ([]string, error) {
+func searchWithRipgrep(ctx context.Context, rgPath, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, onMatch func(file, match string)) ([]string, error) {
 	args, searchPath := buildRgArgs(absPath, isDir, pattern, ignoreCase, literal, contextLines, respectGitignore)
 
 	cmd := exec.CommandContext(ctx, rgPath, args...)
@@ -386,11 +373,11 @@ func searchWithRipgrep(ctx context.Context, rgPath, absPath string, isDir bool, 
 			return matches, nil //nolint:nilerr // return partial matches on cancellation
 		}
 
-		match, isMatch := parseRgLine(scanner.Bytes(), searchPath, include, respectGitignore)
+		file, match, isMatch := parseRgLine(scanner.Bytes(), searchPath, include, respectGitignore)
 		if match != "" {
 			matches = append(matches, match)
 			if onMatch != nil && isMatch {
-				onMatch(match)
+				onMatch(file, match)
 			}
 		}
 	}
@@ -466,7 +453,7 @@ func handleRgScannerErr(ctx context.Context, cmd *exec.Cmd, scanErr error, match
 	return nil, fmt.Errorf("parsing rg output: %w", scanErr)
 }
 
-func parseRgLine(line []byte, baseDir, include string, respectGitignore bool) (string, bool) {
+func parseRgLine(line []byte, baseDir, include string, respectGitignore bool) (string, string, bool) {
 	var entry struct {
 		Type string `json:"type"`
 		Data struct {
@@ -481,11 +468,11 @@ func parseRgLine(line []byte, baseDir, include string, respectGitignore bool) (s
 	}
 
 	if err := json.Unmarshal(line, &entry); err != nil {
-		return "", false
+		return "", "", false
 	}
 
 	if entry.Type != "match" && entry.Type != "context" {
-		return "", false
+		return "", "", false
 	}
 
 	relPath := entry.Data.Path.Text
@@ -498,23 +485,23 @@ func parseRgLine(line []byte, baseDir, include string, respectGitignore bool) (s
 
 	// Skip VCS and dependency directories (defense-in-depth for --no-ignore)
 	if respectGitignore && isSkipPath(relPath) {
-		return "", false
+		return "", "", false
 	}
 
 	if s := getSandboxer(); s != nil && !s.AllowRead(filepath.Join(baseDir, relPath)) {
-		return "", false
+		return "", "", false
 	}
 
 	if !fileMatchesInclude(include, filepath.Base(relPath)) {
-		return "", false
+		return "", "", false
 	}
 
 	content := strings.TrimRight(entry.Data.Lines.Text, "\n\r")
 
-	return fmt.Sprintf("%s:%d:%s", relPath, entry.Data.LineNumber, content), entry.Type == "match"
+	return relPath, fmt.Sprintf("%s:%d:%s", relPath, entry.Data.LineNumber, content), entry.Type == "match"
 }
 
-func searchDir(ctx context.Context, root string, re *regexp.Regexp, contextLines int, include string, respectGitignore bool, onMatch func(string)) ([]string, error) {
+func searchDir(ctx context.Context, root string, re *regexp.Regexp, contextLines int, include string, respectGitignore bool, onMatch func(file, match string)) ([]string, error) {
 	var matches []string
 
 	err := filepath.WalkDir(root, func(walkPath string, d fs.DirEntry, walkErr error) error {
@@ -589,7 +576,7 @@ func fileMatchesInclude(include, name string) bool {
 	return false
 }
 
-func searchFile(ctx context.Context, displayPath, filePath string, re *regexp.Regexp, contextLines int, onMatch func(string)) []string {
+func searchFile(ctx context.Context, displayPath, filePath string, re *regexp.Regexp, contextLines int, onMatch func(file, match string)) []string {
 	if ctx.Err() != nil {
 		return nil
 	}
@@ -644,7 +631,7 @@ func searchFile(ctx context.Context, displayPath, filePath string, re *regexp.Re
 			results = append(results, result)
 
 			if onMatch != nil && re.MatchString(lines[i]) {
-				onMatch(result)
+				onMatch(displayPath, result)
 			}
 		}
 	}

@@ -477,7 +477,7 @@ func TestSearchFileContextCanceledMidScan(t *testing.T) {
 		cancel()
 	}()
 
-	done := make(chan []string)
+	done := make(chan []string, 1)
 
 	go func() {
 		done <- searchFile(ctx, "test.txt", path, re, 0, nil)
@@ -512,7 +512,7 @@ func TestSearchDirContextCanceledMidWalk(t *testing.T) {
 	done := make(chan struct {
 		matches []string
 		err     error
-	})
+	}, 1)
 
 	go func() {
 		m, e := searchDir(ctx, dir, re, 0, "", true, nil)
@@ -701,9 +701,9 @@ func TestProgressCollector(t *testing.T) {
 	// Use direct struct to avoid SDK throttle firing asynchronously.
 	pc := &progressCollector{bus: bus}
 
-	pc.add("file.go:1:match one")
-	pc.add("file.go:2:match two")
-	pc.add("other.go:1:match three")
+	pc.add("file.go")
+	pc.add("file.go")
+	pc.add("other.go")
 
 	pc.publish()
 
@@ -720,8 +720,8 @@ func TestProgressCollectorCurrentFileEdgeCases(t *testing.T) {
 	// Use direct struct to avoid SDK throttle firing asynchronously.
 	pc := &progressCollector{bus: bus}
 
-	// Normal case: extracts file before first colon
-	pc.add("file.go:1:content")
+	// Normal case: file path is set correctly
+	pc.add("file.go")
 	pc.publish()
 
 	events := bus.progressEvents()
@@ -732,9 +732,9 @@ func TestProgressCollectorCurrentFileEdgeCases(t *testing.T) {
 	// Reset
 	bus.events = nil
 
-	// Match starting with colon: currentFile should remain empty
+	// Empty file path: currentFile should remain empty
 	pc = &progressCollector{bus: bus}
-	pc.add(":1:content")
+	pc.add("")
 	pc.publish()
 
 	events = bus.progressEvents()
@@ -745,9 +745,9 @@ func TestProgressCollectorCurrentFileEdgeCases(t *testing.T) {
 	// Reset
 	bus.events = nil
 
-	// Match with no colon: currentFile should remain empty
+	// Empty file path: currentFile should remain empty
 	pc = &progressCollector{bus: bus}
-	pc.add("nocolon")
+	pc.add("")
 	pc.publish()
 
 	events = bus.progressEvents()
@@ -772,7 +772,7 @@ func TestNewProgressCollectorNilBus(t *testing.T) {
 	require.NotNil(t, pc)
 
 	// add and publish should be no-ops without panicking.
-	pc.add("test.go:1:match")
+	pc.add("test.go")
 	pc.publish()
 }
 
@@ -783,7 +783,7 @@ func TestSearchWithStdlibOnMatch(t *testing.T) {
 
 	var callbackMatches []string
 
-	onMatch := func(m string) {
+	onMatch := func(_, m string) {
 		callbackMatches = append(callbackMatches, m)
 	}
 
@@ -800,7 +800,7 @@ func TestSearchFileOnMatch(t *testing.T) {
 
 	var callbackMatches []string
 
-	onMatch := func(m string) {
+	onMatch := func(_, m string) {
 		callbackMatches = append(callbackMatches, m)
 	}
 
@@ -817,7 +817,7 @@ func TestSearchFileOnMatchWithContextLines(t *testing.T) {
 
 	var callbackMatches []string
 
-	onMatch := func(m string) {
+	onMatch := func(_, m string) {
 		callbackMatches = append(callbackMatches, m)
 	}
 
@@ -874,7 +874,7 @@ func TestParseRgLine(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, _ := parseRgLine([]byte(tt.line), baseDir, tt.include, tt.respectGitignore)
+			_, got, _ := parseRgLine([]byte(tt.line), baseDir, tt.include, tt.respectGitignore)
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -890,7 +890,7 @@ func TestParseRgLineSandboxDenied(t *testing.T) {
 	t.Cleanup(func() { setSandboxer(nil) })
 
 	line := `{"type":"match","data":{"path":{"text":"secret.txt"},"line_number":1,"lines":{"text":"findme secret"}}}`
-	got, _ := parseRgLine([]byte(line), dir, "", true)
+	_, got, _ := parseRgLine([]byte(line), dir, "", true)
 	assert.Empty(t, got)
 }
 
