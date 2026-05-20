@@ -220,6 +220,10 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 
 	// Publish final progress event
 	if collector != nil {
+		if collector.cancel != nil {
+			collector.cancel()
+		}
+
 		collector.publish()
 	}
 
@@ -248,12 +252,15 @@ type progressCollector struct {
 	currentFile string
 	bus         sdk.Bus
 	throttle    func()
+	cancel      func()
 }
 
 func newProgressCollector(ctx context.Context, bus sdk.Bus) *progressCollector {
 	pc := &progressCollector{bus: bus}
 	if bus != nil {
-		pc.throttle = sdk.Throttle(ctx, func() {
+		throttleCtx, cancel := context.WithCancel(ctx)
+		pc.cancel = cancel
+		pc.throttle = sdk.Throttle(throttleCtx, func() {
 			pc.publish()
 		}, 200*time.Millisecond)
 	}
@@ -434,6 +441,10 @@ func buildRgArgs(absPath string, isDir bool, pattern string, ignoreCase, literal
 }
 
 func handleRgScannerErr(ctx context.Context, cmd *exec.Cmd, scanErr error, matches []string) ([]string, error) {
+	// Kill the process to prevent deadlock if rg is blocked writing to stdout
+	// after the scanner stopped reading (e.g. token exceeded buffer limit).
+	_ = cmd.Process.Kill()
+
 	if werr := cmd.Wait(); werr != nil {
 		if ctx.Err() != nil {
 			return matches, nil //nolint:nilerr // return partial matches on cancellation
