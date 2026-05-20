@@ -206,10 +206,10 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 	return sdk.ToolResult{Content: result.Format(), IsError: false}, nil
 }
 
-// progressCollector accumulates matches and publishes throttled progress events.
+// progressCollector accumulates match count and publishes throttled progress events.
 type progressCollector struct {
 	mu          sync.Mutex
-	matches     []string
+	matchCount  int
 	currentFile string
 	bus         sdk.Bus
 	throttle    func()
@@ -227,7 +227,7 @@ func newProgressCollector(ctx context.Context, bus sdk.Bus) *progressCollector {
 
 func (pc *progressCollector) add(match string) {
 	pc.mu.Lock()
-	pc.matches = append(pc.matches, match)
+	pc.matchCount++
 	if idx := strings.Index(match, ":"); idx > 0 {
 		pc.currentFile = match[:idx]
 	}
@@ -239,7 +239,7 @@ func (pc *progressCollector) add(match string) {
 
 func (pc *progressCollector) publish() {
 	pc.mu.Lock()
-	count := len(pc.matches)
+	count := pc.matchCount
 	file := pc.currentFile
 	pc.mu.Unlock()
 
@@ -360,6 +360,7 @@ func searchWithRipgrep(ctx context.Context, rgPath, absPath string, isDir bool, 
 	for scanner.Scan() {
 		if ctx.Err() != nil {
 			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
 
 			return matches, nil //nolint:nilerr // return partial matches on cancellation
 		}
@@ -613,6 +614,7 @@ func isSkipDir(name string) bool {
 }
 
 // isSkipPath returns true if the relative path is under a VCS or dependency directory.
+// ripgrep JSON always uses "/" separators regardless of OS.
 func isSkipPath(rel string) bool {
-	return slices.ContainsFunc(strings.Split(rel, string(filepath.Separator)), isSkipDir)
+	return slices.ContainsFunc(strings.Split(rel, "/"), isSkipDir)
 }
