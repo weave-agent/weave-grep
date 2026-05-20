@@ -31,8 +31,8 @@ Add streaming progress to the grep tool so the TUI shows partial results while s
 - [x] Run extension tests — must pass
 
 ### Task 3: Verify integration
-- [ ] Run `go test ./...` in grep extension dir
-- [ ] Run `make lint` if available
+- [x] Run `go test ./...` in grep extension dir
+- [x] Run `make lint` if available (no Makefile present)
 
 ## Technical Details
 
