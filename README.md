@@ -16,6 +16,13 @@ The `--name grep` ensures your fork shadows the official extension.
 weave install github.com/weave-agent/weave-grep --name grep
 ```
 
+## Features
+
+- Searches with ripgrep when available, falls back to Go stdlib regex
+- Publishes streaming `tool.progress` bus events as matches are found (throttled to 200ms)
+- Respects context cancellation for interruptible searches
+- Respects `.gitignore` and skips VCS/dependency directories
+
 ## Development
 
 ```bash
