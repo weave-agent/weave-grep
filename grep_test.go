@@ -283,6 +283,56 @@ func TestExecuteSandboxNil(t *testing.T) {
 	assert.Contains(t, result.Content, "findme normal")
 }
 
+func TestGuardianRequest(t *testing.T) {
+	req := guardianRequest("/tmp/project")
+
+	assert.NotEmpty(t, req.ID)
+	assert.True(t, strings.HasPrefix(req.ID, "grep-guardian-"))
+	assert.Equal(t, "grep", req.ToolName)
+	assert.Equal(t, sdk.GuardianActionRead, req.Action)
+	assert.Equal(t, "/tmp/project", req.Path)
+	assert.Equal(t, "Search file contents", req.Description)
+	assert.Equal(t, "grep", req.Metadata["operation"])
+}
+
+func TestCheckGuardianBlock(t *testing.T) {
+	g := &guardianStub{
+		decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+			assert.Equal(t, "/tmp/secret", req.Path)
+			assert.Equal(t, sdk.GuardianActionRead, req.Action)
+
+			return sdk.GuardianDecision{
+				ID:      "decision-1",
+				Action:  sdk.GuardianDecisionBlock,
+				Profile: "custom",
+				Reason:  "blocked by test policy",
+			}, nil
+		},
+	}
+	setGuardian(g)
+
+	t.Cleanup(func() { setGuardian(nil) })
+
+	req, result := checkGuardian(context.Background(), "/tmp/secret")
+
+	require.NotNil(t, result)
+	assert.True(t, result.IsError)
+	assert.Contains(t, result.Content, "guardian: blocked")
+	assert.Contains(t, result.Content, "action: read")
+	assert.Contains(t, result.Content, "rule: custom")
+	assert.Contains(t, result.Content, "reason: blocked by test policy")
+	assert.Equal(t, "/tmp/secret", req.Path)
+}
+
+func TestAllowSandboxReadPassesGuardianMetadata(t *testing.T) {
+	sb := &metadataSandboxer{}
+
+	assert.True(t, allowSandboxRead(sb, "/tmp/file", "guardian-1"))
+	assert.Equal(t, "/tmp/file", sb.path)
+	assert.Equal(t, "grep", sb.metadata["operation"])
+	assert.Equal(t, "guardian-1", sb.metadata["guardian_request_id"])
+}
+
 func TestLineTruncation(t *testing.T) {
 	longContent := "prefix " + strings.Repeat("x", 1000) + " suffix"
 	line := "file.txt:42:" + longContent
@@ -418,6 +468,44 @@ func (ts *testSandboxer) AllowRead(path string) bool {
 func (ts *testSandboxer) Mode() string   { return "auto" }
 func (ts *testSandboxer) SetMode(string) {}
 
+type metadataSandboxer struct {
+	path     string
+	metadata map[string]any
+}
+
+func (m *metadataSandboxer) AllowRead(path string) bool {
+	m.path = path
+
+	return true
+}
+
+func (m *metadataSandboxer) AllowReadWithMetadata(path string, metadata map[string]any) bool {
+	m.path = path
+	m.metadata = metadata
+
+	return true
+}
+
+type guardianStub struct {
+	decideFn func(context.Context, sdk.GuardianRequest) (sdk.GuardianDecision, error)
+}
+
+func (g *guardianStub) Decide(ctx context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+	if g.decideFn != nil {
+		return g.decideFn(ctx, req)
+	}
+
+	return sdk.GuardianDecision{Action: sdk.GuardianDecisionAllow}, nil
+}
+
+func (g *guardianStub) Resolve(context.Context, string, sdk.GuardianResolution) error {
+	return nil
+}
+
+func (g *guardianStub) Snapshot(context.Context) (sdk.GuardianSnapshot, error) {
+	return sdk.GuardianSnapshot{}, nil
+}
+
 func TestSearchWithStdlibContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -425,7 +513,7 @@ func TestSearchWithStdlibContextCanceled(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "a.txt"), []byte("findme"), 0o644))
 
-	matches, err := searchWithStdlib(ctx, dir, true, "findme", "", false, false, 0, true, nil)
+	matches, err := searchWithStdlib(ctx, dir, true, "findme", "", false, false, 0, true, "", nil)
 	require.NoError(t, err)
 	assert.Nil(t, matches)
 }
@@ -441,7 +529,7 @@ func TestSearchDirContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	matches, err := searchDir(ctx, dir, re, 0, "", true, nil)
+	matches, err := searchDir(ctx, dir, re, 0, "", true, "", nil)
 	require.NoError(t, err)
 	assert.Nil(t, matches)
 }
@@ -516,7 +604,7 @@ func TestSearchDirContextCanceledMidWalk(t *testing.T) {
 	}, 1)
 
 	go func() {
-		m, e := searchDir(ctx, dir, re, 0, "", true, nil)
+		m, e := searchDir(ctx, dir, re, 0, "", true, "", nil)
 		done <- struct {
 			matches []string
 			err     error
@@ -556,7 +644,7 @@ func TestSearchWithRipgrepContextCanceledMidOperation(t *testing.T) {
 	}, 1)
 
 	go func() {
-		m, e := searchWithRipgrep(ctx, "rg", dir, true, "findme", "", false, false, 0, true, nil)
+		m, e := searchWithRipgrep(ctx, "rg", dir, true, "findme", "", false, false, 0, true, "", nil)
 		done <- struct {
 			matches []string
 			err     error
@@ -808,7 +896,7 @@ func TestSearchWithStdlibOnMatch(t *testing.T) {
 		callbackMatches = append(callbackMatches, m)
 	}
 
-	matches, err := searchWithStdlib(context.Background(), dir, true, "findme", "", false, false, 0, true, onMatch)
+	matches, err := searchWithStdlib(context.Background(), dir, true, "findme", "", false, false, 0, true, "", onMatch)
 	require.NoError(t, err)
 	require.NotNil(t, matches)
 	assert.Len(t, matches, 2)
@@ -896,7 +984,7 @@ func TestParseRgLine(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, got, _ := parseRgLine([]byte(tt.line), baseDir, tt.include, tt.respectGitignore)
+			_, got, _ := parseRgLine([]byte(tt.line), baseDir, tt.include, tt.respectGitignore, "")
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -912,12 +1000,12 @@ func TestParseRgLineSandboxDenied(t *testing.T) {
 	t.Cleanup(func() { setSandboxer(nil) })
 
 	line := `{"type":"match","data":{"path":{"text":"secret.txt"},"line_number":1,"lines":{"text":"findme secret"}}}`
-	_, got, _ := parseRgLine([]byte(line), dir, "", true)
+	_, got, _ := parseRgLine([]byte(line), dir, "", true, "")
 	assert.Empty(t, got)
 }
 
 func TestSearchWithStdlibInvalidRegex(t *testing.T) {
-	matches, err := searchWithStdlib(context.Background(), ".", true, "[invalid", "", false, false, 0, true, nil)
+	matches, err := searchWithStdlib(context.Background(), ".", true, "[invalid", "", false, false, 0, true, "", nil)
 	require.Error(t, err)
 	assert.Nil(t, matches)
 }
