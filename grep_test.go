@@ -414,7 +414,11 @@ func TestExecuteWithGuardian(t *testing.T) {
 		assert.NotEmpty(t, gotReq.ID)
 		assert.Equal(t, "grep", gotReq.ToolName)
 		assert.Equal(t, sdk.GuardianActionRead, gotReq.Action)
-		assert.Equal(t, path, gotReq.Path)
+
+		resolvedPath, err := resolveReadPath(path)
+		require.NoError(t, err)
+
+		assert.Equal(t, resolvedPath, gotReq.Path)
 		assert.Equal(t, "Search file contents", gotReq.Description)
 		assert.Equal(t, "grep", gotReq.Metadata["operation"])
 	})
@@ -452,7 +456,11 @@ func TestExecuteWithGuardian(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, result.IsError)
 		assert.Contains(t, result.Content, "findme relative")
-		assert.Equal(t, path, gotPath)
+
+		resolvedPath, err := resolveReadPath(path)
+		require.NoError(t, err)
+
+		assert.Equal(t, resolvedPath, gotPath)
 	})
 
 	t.Run("block decision returns guardian error", func(t *testing.T) {
@@ -568,12 +576,14 @@ func TestExecutePassesGuardianMetadataToSandbox(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "one.txt"), []byte("findme one"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "two.txt"), []byte("findme two"), 0o644))
+	resolvedDir, err := resolveReadPath(dir)
+	require.NoError(t, err)
 
 	var rootReq sdk.GuardianRequest
 
 	setGuardian(&testGuardian{
 		decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
-			if req.Path == dir {
+			if req.Path == resolvedDir {
 				rootReq = req
 			}
 
@@ -629,12 +639,18 @@ func TestExecuteGuardianBlocksDirectoryChildBeforeRead(t *testing.T) {
 	require.NoError(t, os.WriteFile(allowedPath, []byte("findme allowed"), 0o644))
 	require.NoError(t, os.WriteFile(blockedPath, []byte("findme secret"), 0o644))
 
+	resolvedDir, err := resolveReadPath(dir)
+	require.NoError(t, err)
+
+	resolvedBlockedPath, err := resolveReadPath(blockedPath)
+	require.NoError(t, err)
+
 	var checkedPaths []string
 
 	setGuardian(&testGuardian{
 		decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
 			checkedPaths = append(checkedPaths, req.Path)
-			if req.Path == blockedPath {
+			if req.Path == resolvedBlockedPath {
 				return sdk.GuardianDecision{
 					RequestID: req.ID,
 					Action:    sdk.GuardianDecisionBlock,
@@ -658,9 +674,125 @@ func TestExecuteGuardianBlocksDirectoryChildBeforeRead(t *testing.T) {
 	assert.Contains(t, result.Content, "guardian: blocked")
 	assert.Contains(t, result.Content, "reason: blocked child")
 	assert.NotContains(t, result.Content, "findme secret")
-	assert.Contains(t, checkedPaths, dir)
-	assert.Contains(t, checkedPaths, allowedPath)
-	assert.Contains(t, checkedPaths, blockedPath)
+	assert.Contains(t, checkedPaths, resolvedDir)
+	assert.Contains(t, checkedPaths, resolvedBlockedPath)
+}
+
+func TestExecuteGuardianChecksResolvedSymlinkTarget(t *testing.T) {
+	origGuardian := getGuardian()
+	origSandboxer := getSandboxer()
+
+	setGuardian(nil)
+	setSandboxer(nil)
+
+	t.Cleanup(func() {
+		setGuardian(origGuardian)
+		setSandboxer(origSandboxer)
+	})
+
+	dir := t.TempDir()
+	target := filepath.Join(t.TempDir(), "secret.txt")
+	link := filepath.Join(dir, "link.txt")
+
+	require.NoError(t, os.WriteFile(target, []byte("findme secret"), 0o644))
+
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	resolvedTarget, err := resolveReadPath(target)
+	require.NoError(t, err)
+
+	resolvedLink, err := resolveReadPath(link)
+	require.NoError(t, err)
+
+	var checkedPaths []string
+
+	setGuardian(&testGuardian{
+		decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+			checkedPaths = append(checkedPaths, req.Path)
+			if req.Path == resolvedTarget {
+				return sdk.GuardianDecision{
+					RequestID: req.ID,
+					Action:    sdk.GuardianDecisionBlock,
+					Reason:    "blocked target",
+				}, nil
+			}
+
+			return sdk.GuardianDecision{
+				RequestID: req.ID,
+				Action:    sdk.GuardianDecisionAllow,
+			}, nil
+		},
+	})
+
+	result, err := (&tool{}).Execute(context.Background(), map[string]any{
+		"pattern": "findme",
+		"path":    link,
+	})
+	require.NoError(t, err)
+	assert.True(t, result.IsError)
+	assert.Contains(t, result.Content, "guardian: blocked")
+	assert.Contains(t, result.Content, "reason: blocked target")
+	assert.NotContains(t, result.Content, "findme secret")
+	assert.Contains(t, checkedPaths, resolvedTarget)
+	assert.NotContains(t, checkedPaths, link)
+	assert.NotContains(t, checkedPaths, resolvedLink+string(filepath.Separator))
+}
+
+func TestExecuteGuardianPolicyErrorDoesNotFallback(t *testing.T) {
+	if _, err := exec.LookPath("rg"); err != nil {
+		t.Skip("rg not in PATH")
+	}
+
+	origGuardian := getGuardian()
+	origSandboxer := getSandboxer()
+
+	setGuardian(nil)
+	setSandboxer(nil)
+
+	t.Cleanup(func() {
+		setGuardian(origGuardian)
+		setSandboxer(origSandboxer)
+	})
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secret.txt")
+	require.NoError(t, os.WriteFile(path, []byte("findme secret"), 0o644))
+	resolvedPath, err := resolveReadPath(path)
+	require.NoError(t, err)
+
+	var blockedOnce bool
+
+	setGuardian(&testGuardian{
+		decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+			if req.Path == resolvedPath && !blockedOnce {
+				blockedOnce = true
+
+				return sdk.GuardianDecision{
+					RequestID: req.ID,
+					Action:    sdk.GuardianDecisionBlock,
+					Reason:    "transient block",
+				}, nil
+			}
+
+			return sdk.GuardianDecision{
+				RequestID: req.ID,
+				Action:    sdk.GuardianDecisionAllow,
+			}, nil
+		},
+	})
+
+	result, err := (&tool{}).Execute(context.Background(), map[string]any{
+		"pattern": "findme",
+		"path":    dir,
+	})
+	require.NoError(t, err)
+	assert.True(t, result.IsError)
+	assert.Contains(t, result.Content, "guardian: blocked")
+	assert.Contains(t, result.Content, "reason: transient block")
+	assert.NotContains(t, result.Content, "findme secret")
+	assert.True(t, blockedOnce)
 }
 
 func TestExecuteGuardianSandboxOrdering(t *testing.T) {
