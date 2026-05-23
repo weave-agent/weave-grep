@@ -269,6 +269,62 @@ func TestExecuteSandboxAllowed(t *testing.T) {
 	assert.Contains(t, result.Content, "findme here")
 }
 
+func TestExecuteSandboxChecksDirectoryChildrenBeforeSearch(t *testing.T) {
+	if _, err := exec.LookPath("rg"); err != nil {
+		t.Skip("rg not in PATH")
+	}
+
+	origGuardian := getGuardian()
+	origSandboxer := getSandboxer()
+
+	setGuardian(nil)
+	setSandboxer(nil)
+
+	t.Cleanup(func() {
+		setGuardian(origGuardian)
+		setSandboxer(origSandboxer)
+	})
+
+	dir := t.TempDir()
+	allowedPath := filepath.Join(dir, "allowed.txt")
+	blockedPath := filepath.Join(dir, "secret.txt")
+
+	require.NoError(t, os.WriteFile(allowedPath, []byte("findme allowed"), 0o644))
+	require.NoError(t, os.WriteFile(blockedPath, []byte("findme secret"), 0o644))
+
+	resolvedAllowed, err := resolveReadPath(allowedPath)
+	require.NoError(t, err)
+
+	resolvedBlocked, err := resolveReadPath(blockedPath)
+	require.NoError(t, err)
+
+	sb := &testSandboxer{
+		allowReadFn: func(path string) bool {
+			return path != resolvedBlocked
+		},
+	}
+	setSandboxer(sb)
+
+	result, err := (&tool{}).Execute(context.Background(), map[string]any{
+		"pattern": "findme",
+		"path":    dir,
+	})
+	require.NoError(t, err)
+	assert.False(t, result.IsError)
+	assert.Contains(t, result.Content, "findme allowed")
+	assert.NotContains(t, result.Content, "findme secret")
+
+	checkedPaths := make([]string, 0, len(sb.requests))
+
+	for _, req := range sb.requests {
+		require.Len(t, req.Filesystem, 1)
+		checkedPaths = append(checkedPaths, req.Filesystem[0].Path)
+	}
+
+	assert.Contains(t, checkedPaths, resolvedAllowed)
+	assert.Contains(t, checkedPaths, resolvedBlocked)
+}
+
 func TestExecuteSandboxNil(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "normal.txt"), []byte("findme normal"), 0o644))
@@ -795,6 +851,55 @@ func TestExecuteGuardianPolicyErrorDoesNotFallback(t *testing.T) {
 	assert.True(t, blockedOnce)
 }
 
+func TestExecuteGuardianSkipsFileSwappedDuringAuthorization(t *testing.T) {
+	origGuardian := getGuardian()
+	origSandboxer := getSandboxer()
+
+	setGuardian(nil)
+	setSandboxer(nil)
+
+	t.Cleanup(func() {
+		setGuardian(origGuardian)
+		setSandboxer(origSandboxer)
+	})
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "target.txt")
+	backup := filepath.Join(dir, "authorized.txt")
+
+	require.NoError(t, os.WriteFile(path, []byte("safe"), 0o644))
+
+	resolvedPath, err := resolveReadPath(path)
+	require.NoError(t, err)
+
+	var swapped bool
+
+	setGuardian(&testGuardian{
+		decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+			if req.Path == resolvedPath && !swapped {
+				swapped = true
+
+				require.NoError(t, os.Rename(path, backup))
+				require.NoError(t, os.WriteFile(path, []byte("findme swapped"), 0o644))
+			}
+
+			return sdk.GuardianDecision{
+				RequestID: req.ID,
+				Action:    sdk.GuardianDecisionAllow,
+			}, nil
+		},
+	})
+
+	result, err := (&tool{}).Execute(context.Background(), map[string]any{
+		"pattern": "findme",
+		"path":    path,
+	})
+	require.NoError(t, err)
+	assert.False(t, result.IsError)
+	assert.NotContains(t, result.Content, "findme swapped")
+	assert.True(t, swapped)
+}
+
 func TestExecuteGuardianSandboxOrdering(t *testing.T) {
 	origGuardian := getGuardian()
 	origSandboxer := getSandboxer()
@@ -1145,7 +1250,7 @@ func TestSearchWithStdlibContextCanceled(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "a.txt"), []byte("findme"), 0o644))
 
-	matches, err := searchWithStdlib(ctx, dir, true, "findme", "", false, false, 0, true, nil)
+	matches, err := searchWithStdlib(ctx, dir, true, "findme", "", false, false, 0, true, nil, nil)
 	require.NoError(t, err)
 	assert.Nil(t, matches)
 }
@@ -1176,7 +1281,7 @@ func TestSearchFileContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	matches := searchFile(ctx, "test.txt", path, re, 0, nil)
+	matches := searchFile(ctx, "test.txt", path, nil, re, 0, nil)
 	assert.Nil(t, matches)
 }
 
@@ -1202,7 +1307,7 @@ func TestSearchFileContextCanceledMidScan(t *testing.T) {
 	done := make(chan []string, 1)
 
 	go func() {
-		done <- searchFile(ctx, "test.txt", path, re, 0, nil)
+		done <- searchFile(ctx, "test.txt", path, nil, re, 0, nil)
 	}()
 
 	select {
@@ -1528,7 +1633,7 @@ func TestSearchWithStdlibOnMatch(t *testing.T) {
 		callbackMatches = append(callbackMatches, m)
 	}
 
-	matches, err := searchWithStdlib(context.Background(), dir, true, "findme", "", false, false, 0, true, onMatch)
+	matches, err := searchWithStdlib(context.Background(), dir, true, "findme", "", false, false, 0, true, nil, onMatch)
 	require.NoError(t, err)
 	require.NotNil(t, matches)
 	assert.Len(t, matches, 2)
@@ -1546,7 +1651,7 @@ func TestSearchFileOnMatch(t *testing.T) {
 		callbackMatches = append(callbackMatches, m)
 	}
 
-	matches := searchFile(context.Background(), "test.txt", path, re, 0, onMatch)
+	matches := searchFile(context.Background(), "test.txt", path, nil, re, 0, onMatch)
 	require.Len(t, matches, 1)
 	assert.Equal(t, matches, callbackMatches)
 	assert.Contains(t, callbackMatches[0], "findme here")
@@ -1563,11 +1668,29 @@ func TestSearchFileOnMatchWithContextLines(t *testing.T) {
 		callbackMatches = append(callbackMatches, m)
 	}
 
-	matches := searchFile(context.Background(), "test.txt", path, re, 1, onMatch)
+	matches := searchFile(context.Background(), "test.txt", path, nil, re, 1, onMatch)
 	require.Len(t, matches, 3)
 	// onMatch is only called for actual matches, not context lines.
 	require.Len(t, callbackMatches, 1)
 	assert.Contains(t, callbackMatches[0], "MATCH")
+}
+
+func TestSearchFileSkipsPathSwappedAfterAuthorization(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.txt")
+	backup := filepath.Join(dir, "authorized.txt")
+
+	require.NoError(t, os.WriteFile(path, []byte("safe"), 0o644))
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+
+	require.NoError(t, os.Rename(path, backup))
+	require.NoError(t, os.WriteFile(path, []byte("findme swapped"), 0o644))
+
+	re := regexp.MustCompile("findme")
+	matches := searchFile(context.Background(), "test.txt", path, info, re, 0, nil)
+	assert.Empty(t, matches)
 }
 
 func TestParseRgLine(t *testing.T) {
@@ -1637,7 +1760,7 @@ func TestParseRgLineSandboxDenied(t *testing.T) {
 }
 
 func TestSearchWithStdlibInvalidRegex(t *testing.T) {
-	matches, err := searchWithStdlib(context.Background(), ".", true, "[invalid", "", false, false, 0, true, nil)
+	matches, err := searchWithStdlib(context.Background(), ".", true, "[invalid", "", false, false, 0, true, nil, nil)
 	require.Error(t, err)
 	assert.Nil(t, matches)
 }

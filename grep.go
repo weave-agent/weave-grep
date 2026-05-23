@@ -310,6 +310,7 @@ type searchParams struct {
 	contextLines     int
 	respectGitignore bool
 	guardianReqID    string
+	authorizedInfo   os.FileInfo
 }
 
 func (t *tool) parseSearchParams(ctx context.Context, args map[string]any) (searchParams, sdk.ToolResult) {
@@ -351,6 +352,11 @@ func (t *tool) parseSearchParams(ctx context.Context, args map[string]any) (sear
 		return searchParams{}, sdk.ToolResult{Content: fmt.Sprintf("error: %s", err), IsError: true}
 	}
 
+	info, err := os.Stat(readPath)
+	if err != nil {
+		return searchParams{}, sdk.ToolResult{Content: fmt.Sprintf("error: %s", err), IsError: true}
+	}
+
 	guardianReq, guardianErr := checkGuardian(ctx, readPath)
 	if guardianErr != nil {
 		return searchParams{}, *guardianErr
@@ -361,11 +367,6 @@ func (t *tool) parseSearchParams(ctx context.Context, args map[string]any) (sear
 		if !allowed {
 			return searchParams{}, sdk.ToolResult{Content: "sandbox: read denied — " + reason, IsError: true}
 		}
-	}
-
-	info, err := os.Stat(readPath)
-	if err != nil {
-		return searchParams{}, sdk.ToolResult{Content: fmt.Sprintf("error: %s", err), IsError: true}
 	}
 
 	// Validate regex early so both rg and stdlib paths get consistent error handling
@@ -397,6 +398,7 @@ func (t *tool) parseSearchParams(ctx context.Context, args map[string]any) (sear
 		contextLines:     contextLines,
 		respectGitignore: respectGitignore,
 		guardianReqID:    guardianReq.ID,
+		authorizedInfo:   info,
 	}, sdk.ToolResult{}
 }
 
@@ -415,7 +417,7 @@ func (t *tool) Execute(ctx context.Context, args map[string]any) (sdk.ToolResult
 		defer collector.cancel()
 	}
 
-	matches, searchErr := t.search(ctx, params.absPath, params.isDir, params.pattern, params.include, params.ignoreCase, params.literal, params.contextLines, params.respectGitignore, params.guardianReqID, func(file, _ string) {
+	matches, searchErr := t.search(ctx, params.absPath, params.isDir, params.pattern, params.include, params.ignoreCase, params.literal, params.contextLines, params.respectGitignore, params.guardianReqID, params.authorizedInfo, func(file, _ string) {
 		if collector != nil {
 			collector.add(file)
 		}
@@ -509,16 +511,18 @@ func (pc *progressCollector) publish(final bool) {
 }
 
 // search tries rg first, then falls back to stdlib.
-func (t *tool) search(ctx context.Context, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, guardianRequestID string, onMatch func(file, match string)) ([]string, error) {
-	// Use rg when available. Matches from denied paths are filtered by
-	// AllowRead checks in parseRgLine.
+func (t *tool) search(ctx context.Context, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, guardianRequestID string, authorizedInfo os.FileInfo, onMatch func(file, match string)) ([]string, error) {
 	rgPath := ripgrep.Find()
 	if rgPath == "" {
-		return searchWithStdlib(ctx, absPath, isDir, pattern, include, ignoreCase, literal, contextLines, respectGitignore, onMatch)
+		return searchWithStdlib(ctx, absPath, isDir, pattern, include, ignoreCase, literal, contextLines, respectGitignore, authorizedInfo, onMatch)
 	}
 
-	if isDir && hasGuardian() {
+	if isDir && (hasGuardian() || getSandboxer() != nil) {
 		return searchDirectoryWithGuardian(ctx, rgPath, absPath, pattern, include, ignoreCase, literal, contextLines, respectGitignore, onMatch)
+	}
+
+	if !isDir && (hasGuardian() || getSandboxer() != nil) {
+		return searchWithStdlib(ctx, absPath, false, pattern, include, ignoreCase, literal, contextLines, respectGitignore, authorizedInfo, onMatch)
 	}
 
 	matches, err := searchWithRipgrep(ctx, rgPath, absPath, isDir, pattern, include, ignoreCase, literal, contextLines, respectGitignore, guardianRequestID, onMatch)
@@ -526,7 +530,7 @@ func (t *tool) search(ctx context.Context, absPath string, isDir bool, pattern, 
 		return matches, nil
 	}
 
-	return searchWithStdlib(ctx, absPath, isDir, pattern, include, ignoreCase, literal, contextLines, respectGitignore, onMatch)
+	return searchWithStdlib(ctx, absPath, isDir, pattern, include, ignoreCase, literal, contextLines, respectGitignore, authorizedInfo, onMatch)
 }
 
 func searchDirectoryWithGuardian(ctx context.Context, rgPath, absPath, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, onMatch func(file, match string)) ([]string, error) {
@@ -539,10 +543,10 @@ func searchDirectoryWithGuardian(ctx context.Context, rgPath, absPath, pattern, 
 		return matches, pe
 	}
 
-	return searchWithStdlib(ctx, absPath, true, pattern, include, ignoreCase, literal, contextLines, respectGitignore, onMatch)
+	return searchWithStdlib(ctx, absPath, true, pattern, include, ignoreCase, literal, contextLines, respectGitignore, nil, onMatch)
 }
 
-func searchWithStdlib(ctx context.Context, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, onMatch func(file, match string)) ([]string, error) {
+func searchWithStdlib(ctx context.Context, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, authorizedInfo os.FileInfo, onMatch func(file, match string)) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil //nolint:nilerr // return partial matches on cancellation
 	}
@@ -560,7 +564,7 @@ func searchWithStdlib(ctx context.Context, absPath string, isDir bool, pattern, 
 		return nil, nil
 	}
 
-	return searchFile(ctx, filepath.Base(absPath), absPath, re, contextLines, onMatch), nil
+	return searchFile(ctx, filepath.Base(absPath), absPath, authorizedInfo, re, contextLines, onMatch), nil
 }
 
 func compileSearchRegexp(pattern string, ignoreCase, literal bool) (*regexp.Regexp, error) {
@@ -687,6 +691,11 @@ func searchRipgrepFile(ctx context.Context, absPath, relPath string, re *regexp.
 		return nil, nil //nolint:nilerr // broken or inaccessible paths are skipped
 	}
 
+	info, err := os.Stat(readPath)
+	if err != nil {
+		return nil, nil //nolint:nilerr // inaccessible paths are skipped
+	}
+
 	fileGuardianReq, guardianErr := checkGuardian(ctx, readPath)
 	if guardianErr != nil {
 		return nil, policyError{message: guardianErr.Content}
@@ -699,7 +708,7 @@ func searchRipgrepFile(ctx context.Context, absPath, relPath string, re *regexp.
 		}
 	}
 
-	return searchFile(ctx, relPath, readPath, re, contextLines, onMatch), nil
+	return searchFile(ctx, relPath, readPath, info, re, contextLines, onMatch), nil
 }
 
 func searchWithRipgrep(ctx context.Context, rgPath, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, guardianRequestID string, onMatch func(file, match string)) ([]string, error) {
@@ -916,6 +925,11 @@ func searchDir(ctx context.Context, root string, re *regexp.Regexp, contextLines
 			return nil //nolint:nilerr // broken or inaccessible paths are skipped
 		}
 
+		info, err := os.Stat(readPath)
+		if err != nil {
+			return nil //nolint:nilerr // inaccessible paths are skipped
+		}
+
 		fileGuardianReq, guardianErr := checkGuardian(ctx, readPath)
 		if guardianErr != nil {
 			return policyError{message: guardianErr.Content}
@@ -928,7 +942,7 @@ func searchDir(ctx context.Context, root string, re *regexp.Regexp, contextLines
 			}
 		}
 
-		fileMatches := searchFile(ctx, relPath, readPath, re, contextLines, onMatch)
+		fileMatches := searchFile(ctx, relPath, readPath, info, re, contextLines, onMatch)
 		matches = append(matches, fileMatches...)
 
 		return nil
@@ -977,21 +991,12 @@ func fileMatchesInclude(include, name string) bool {
 	return false
 }
 
-func searchFile(ctx context.Context, displayPath, filePath string, re *regexp.Regexp, contextLines int, onMatch func(file, match string)) []string {
+func searchFile(ctx context.Context, displayPath, filePath string, expectedInfo os.FileInfo, re *regexp.Regexp, contextLines int, onMatch func(file, match string)) []string {
 	if ctx.Err() != nil {
 		return nil
 	}
 
-	fi, err := os.Stat(filePath)
-	if err != nil || fi.Size() > 10*1024*1024 {
-		return nil
-	}
-
-	if isBinaryFile(filePath) {
-		return nil
-	}
-
-	f, err := os.Open(filePath)
+	f, err := openAuthorizedTextFile(filePath, expectedInfo)
 	if err != nil {
 		return nil
 	}
@@ -1014,6 +1019,58 @@ func searchFile(ctx context.Context, displayPath, filePath string, re *regexp.Re
 		return nil
 	}
 
+	return collectFileMatches(ctx, displayPath, lines, re, contextLines, onMatch)
+}
+
+func openAuthorizedTextFile(filePath string, expectedInfo os.FileInfo) (*os.File, error) {
+	fi := expectedInfo
+	if fi == nil {
+		var err error
+
+		fi, err = os.Stat(filePath)
+		if err != nil {
+			return nil, fmt.Errorf("stat file: %w", err)
+		}
+	}
+
+	if fi.Size() > 10*1024*1024 {
+		return nil, errors.New("file too large")
+	}
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("open file: %w", err)
+	}
+
+	openedInfo, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+
+		return nil, fmt.Errorf("stat open file: %w", err)
+	}
+
+	if !openedInfo.Mode().IsRegular() || openedInfo.Size() > 10*1024*1024 {
+		_ = f.Close()
+
+		return nil, errors.New("not a searchable file")
+	}
+
+	if expectedInfo != nil && !os.SameFile(fi, openedInfo) {
+		_ = f.Close()
+
+		return nil, errors.New("file changed after authorization")
+	}
+
+	if isBinaryOpenFile(f) {
+		_ = f.Close()
+
+		return nil, errors.New("binary file")
+	}
+
+	return f, nil
+}
+
+func collectFileMatches(ctx context.Context, displayPath string, lines []string, re *regexp.Regexp, contextLines int, onMatch func(file, match string)) []string {
 	var results []string
 
 	matched := make(map[int]bool)
@@ -1046,17 +1103,15 @@ func searchFile(ctx context.Context, displayPath, filePath string, re *regexp.Re
 	return results
 }
 
-func isBinaryFile(path string) bool {
-	f, err := os.Open(path)
-	if err != nil {
-		return true
-	}
-	defer f.Close()
-
+func isBinaryOpenFile(f *os.File) bool {
 	buf := make([]byte, 512)
 
 	n, err := f.Read(buf)
-	if err != nil {
+	if err != nil && !errors.Is(err, io.EOF) {
+		return true
+	}
+
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return true
 	}
 
