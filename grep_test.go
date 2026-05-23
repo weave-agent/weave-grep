@@ -790,6 +790,41 @@ func TestRespectGitignore(t *testing.T) {
 	assert.Contains(t, result.Content, "findme visible")
 }
 
+func TestRespectGitignoreWithGuardian(t *testing.T) {
+	if _, err := exec.LookPath("rg"); err != nil {
+		t.Skip("rg not in PATH")
+	}
+
+	origGuardian := getGuardian()
+	origSandboxer := getSandboxer()
+
+	setGuardian(&testGuardian{})
+	setSandboxer(nil)
+
+	t.Cleanup(func() {
+		setGuardian(origGuardian)
+		setSandboxer(origSandboxer)
+	})
+
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("ignored.txt\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "ignored.txt"), []byte("findme ignored"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "visible.txt"), []byte("findme visible"), 0o644))
+
+	gitCmd := exec.Command("git", "init")
+	gitCmd.Dir = dir
+	require.NoError(t, gitCmd.Run())
+
+	cfg := &testConfig{respectGitignore: true}
+	result, err := (&tool{cfg: cfg}).Execute(context.Background(), map[string]any{
+		"pattern": "findme",
+		"path":    dir,
+	})
+	require.NoError(t, err)
+	assert.NotContains(t, result.Content, "findme ignored")
+	assert.Contains(t, result.Content, "findme visible")
+}
+
 func TestNoRespectGitignore(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("ignored.txt\n"), 0o644))

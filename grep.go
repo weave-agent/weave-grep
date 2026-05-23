@@ -456,7 +456,16 @@ func (pc *progressCollector) publish(final bool) {
 func (t *tool) search(ctx context.Context, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, guardianRequestID string, onMatch func(file, match string)) ([]string, error) {
 	// Use rg when available. Matches from denied paths are filtered by
 	// AllowRead checks in parseRgLine.
-	if rgPath := ripgrep.Find(); rgPath != "" && (!isDir || !hasGuardian()) {
+	if rgPath := ripgrep.Find(); rgPath != "" {
+		if isDir && hasGuardian() {
+			matches, err := searchWithRipgrepFiles(ctx, rgPath, absPath, pattern, include, ignoreCase, literal, contextLines, respectGitignore, onMatch)
+			if err == nil {
+				return matches, nil
+			}
+
+			return searchWithStdlib(ctx, absPath, isDir, pattern, include, ignoreCase, literal, contextLines, respectGitignore, onMatch)
+		}
+
 		matches, err := searchWithRipgrep(ctx, rgPath, absPath, isDir, pattern, include, ignoreCase, literal, contextLines, respectGitignore, guardianRequestID, onMatch)
 		if err == nil {
 			return matches, nil
@@ -471,6 +480,23 @@ func searchWithStdlib(ctx context.Context, absPath string, isDir bool, pattern, 
 		return nil, nil //nolint:nilerr // return partial matches on cancellation
 	}
 
+	re, err := compileSearchRegexp(pattern, ignoreCase, literal)
+	if err != nil {
+		return nil, err
+	}
+
+	if isDir {
+		return searchDir(ctx, absPath, re, contextLines, include, respectGitignore, onMatch)
+	}
+
+	if !fileMatchesInclude(include, filepath.Base(absPath)) {
+		return nil, nil
+	}
+
+	return searchFile(ctx, filepath.Base(absPath), absPath, re, contextLines, onMatch), nil
+}
+
+func compileSearchRegexp(pattern string, ignoreCase, literal bool) (*regexp.Regexp, error) {
 	expr := pattern
 	if literal {
 		expr = regexp.QuoteMeta(pattern)
@@ -485,15 +511,99 @@ func searchWithStdlib(ctx context.Context, absPath string, isDir bool, pattern, 
 		return nil, fmt.Errorf("compile regex: %w", err)
 	}
 
-	if isDir {
-		return searchDir(ctx, absPath, re, contextLines, include, respectGitignore, onMatch)
+	return re, nil
+}
+
+func searchWithRipgrepFiles(ctx context.Context, rgPath, absPath, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, onMatch func(file, match string)) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil //nolint:nilerr // return partial matches on cancellation
 	}
 
-	if !fileMatchesInclude(include, filepath.Base(absPath)) {
-		return nil, nil
+	re, err := compileSearchRegexp(pattern, ignoreCase, literal)
+	if err != nil {
+		return nil, err
 	}
 
-	return searchFile(ctx, filepath.Base(absPath), absPath, re, contextLines, onMatch), nil
+	args := []string{"--files", "--hidden"}
+	if !respectGitignore {
+		args = append(args, "--no-ignore")
+	}
+
+	args = append(args, ".")
+
+	cmd := exec.CommandContext(ctx, rgPath, args...)
+	cmd.Dir = absPath
+	cmd.Stderr = io.Discard
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("rg files stdout pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		_ = stdout.Close()
+
+		return nil, fmt.Errorf("rg files start: %w", err)
+	}
+
+	var matches []string
+
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+
+	for scanner.Scan() {
+		if ctx.Err() != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+
+			return matches, nil //nolint:nilerr // return partial matches on cancellation
+		}
+
+		relPath := filepath.Clean(scanner.Text())
+		if relPath == "." || strings.HasPrefix(relPath, ".."+string(filepath.Separator)) || filepath.IsAbs(relPath) {
+			continue
+		}
+
+		if !fileMatchesInclude(include, filepath.Base(relPath)) {
+			continue
+		}
+
+		filePath := filepath.Join(absPath, relPath)
+
+		fileGuardianReq, guardianErr := checkGuardian(ctx, filePath)
+		if guardianErr != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+
+			return matches, errors.New(guardianErr.Content)
+		}
+
+		if s := getSandboxer(); !allowSandboxRead(s, filePath, fileGuardianReq.ID) {
+			continue
+		}
+
+		fileMatches := searchFile(ctx, relPath, filePath, re, contextLines, onMatch)
+		matches = append(matches, fileMatches...)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return handleRgScannerErr(ctx, cmd, err, matches)
+	}
+
+	if err := cmd.Wait(); err != nil {
+		if ctx.Err() != nil {
+			return matches, nil //nolint:nilerr // return partial matches on cancellation
+		}
+
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return matches, nil
+		}
+
+		return nil, fmt.Errorf("rg files: %w", err)
+	}
+
+	return matches, nil
 }
 
 func searchWithRipgrep(ctx context.Context, rgPath, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, guardianRequestID string, onMatch func(file, match string)) ([]string, error) {
