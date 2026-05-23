@@ -87,6 +87,10 @@ func getGuardian() sdk.Guardian {
 	return g
 }
 
+func hasGuardian() bool {
+	return getGuardian() != nil
+}
+
 //nolint:gochecknoinits // SDK requires init() for tool registration
 func init() {
 	sdk.OnBusReady(func(bus sdk.Bus) {
@@ -452,17 +456,17 @@ func (pc *progressCollector) publish(final bool) {
 func (t *tool) search(ctx context.Context, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, guardianRequestID string, onMatch func(file, match string)) ([]string, error) {
 	// Use rg when available. Matches from denied paths are filtered by
 	// AllowRead checks in parseRgLine.
-	if rgPath := ripgrep.Find(); rgPath != "" {
+	if rgPath := ripgrep.Find(); rgPath != "" && (!isDir || !hasGuardian()) {
 		matches, err := searchWithRipgrep(ctx, rgPath, absPath, isDir, pattern, include, ignoreCase, literal, contextLines, respectGitignore, guardianRequestID, onMatch)
 		if err == nil {
 			return matches, nil
 		}
 	}
 
-	return searchWithStdlib(ctx, absPath, isDir, pattern, include, ignoreCase, literal, contextLines, respectGitignore, guardianRequestID, onMatch)
+	return searchWithStdlib(ctx, absPath, isDir, pattern, include, ignoreCase, literal, contextLines, respectGitignore, onMatch)
 }
 
-func searchWithStdlib(ctx context.Context, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, guardianRequestID string, onMatch func(file, match string)) ([]string, error) {
+func searchWithStdlib(ctx context.Context, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, onMatch func(file, match string)) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil //nolint:nilerr // return partial matches on cancellation
 	}
@@ -482,7 +486,7 @@ func searchWithStdlib(ctx context.Context, absPath string, isDir bool, pattern, 
 	}
 
 	if isDir {
-		return searchDir(ctx, absPath, re, contextLines, include, respectGitignore, guardianRequestID, onMatch)
+		return searchDir(ctx, absPath, re, contextLines, include, respectGitignore, onMatch)
 	}
 
 	if !fileMatchesInclude(include, filepath.Base(absPath)) {
@@ -666,7 +670,7 @@ func parseRgLine(line []byte, baseDir, include string, respectGitignore bool, gu
 	return relPath, fmt.Sprintf("%s:%d:%s", relPath, entry.Data.LineNumber, content), entry.Type == "match"
 }
 
-func searchDir(ctx context.Context, root string, re *regexp.Regexp, contextLines int, include string, respectGitignore bool, guardianRequestID string, onMatch func(file, match string)) ([]string, error) {
+func searchDir(ctx context.Context, root string, re *regexp.Regexp, contextLines int, include string, respectGitignore bool, onMatch func(file, match string)) ([]string, error) {
 	var matches []string
 
 	err := filepath.WalkDir(root, func(walkPath string, d fs.DirEntry, walkErr error) error {
@@ -691,7 +695,12 @@ func searchDir(ctx context.Context, root string, re *regexp.Regexp, contextLines
 			return nil
 		}
 
-		if s := getSandboxer(); !allowSandboxRead(s, walkPath, guardianRequestID) {
+		fileGuardianReq, guardianErr := checkGuardian(ctx, walkPath)
+		if guardianErr != nil {
+			return errors.New(guardianErr.Content)
+		}
+
+		if s := getSandboxer(); !allowSandboxRead(s, walkPath, fileGuardianReq.ID) {
 			return nil
 		}
 
