@@ -328,12 +328,16 @@ func TestCheckGuardianBlock(t *testing.T) {
 }
 
 func TestAllowSandboxReadPassesGuardianMetadata(t *testing.T) {
-	sb := &metadataSandboxer{}
+	sb := &testSandboxer{}
 
-	assert.True(t, allowSandboxRead(sb, "/tmp/file", "guardian-1"))
-	assert.Equal(t, "/tmp/file", sb.path)
-	assert.Equal(t, "grep", sb.metadata["operation"])
-	assert.Equal(t, "guardian-1", sb.metadata["guardian_request_id"])
+	allowed, reason := allowSandboxRead(context.Background(), sb, "/tmp/file", "guardian-1")
+	assert.True(t, allowed)
+	assert.Empty(t, reason)
+	require.Len(t, sb.requests, 1)
+	assert.Equal(t, "/tmp/file", sb.requests[0].Filesystem[0].Path)
+	assert.Equal(t, sdk.SandboxFilesystemRead, sb.requests[0].Filesystem[0].Access)
+	assert.Equal(t, "grep", sb.requests[0].Metadata["operation"])
+	assert.Equal(t, "guardian-1", sb.requests[0].Metadata["guardian_request_id"])
 }
 
 func TestGuardianAndSandboxRegistration(t *testing.T) {
@@ -413,6 +417,42 @@ func TestExecuteWithGuardian(t *testing.T) {
 		assert.Equal(t, path, gotReq.Path)
 		assert.Equal(t, "Search file contents", gotReq.Description)
 		assert.Equal(t, "grep", gotReq.Metadata["operation"])
+	})
+
+	t.Run("guardian receives absolute path", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "relative.txt")
+		require.NoError(t, os.WriteFile(path, []byte("findme relative"), 0o644))
+
+		cwd, err := os.Getwd()
+		require.NoError(t, err)
+
+		relPath, err := filepath.Rel(cwd, path)
+		require.NoError(t, err)
+		require.NotEqual(t, path, relPath)
+
+		var gotPath string
+
+		setGuardian(&testGuardian{
+			decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+				gotPath = req.Path
+
+				return sdk.GuardianDecision{
+					RequestID: req.ID,
+					Action:    sdk.GuardianDecisionAllow,
+				}, nil
+			},
+		})
+		setSandboxer(nil)
+
+		result, err := (&tool{}).Execute(context.Background(), map[string]any{
+			"pattern": "findme",
+			"path":    relPath,
+		})
+		require.NoError(t, err)
+		assert.False(t, result.IsError)
+		assert.Contains(t, result.Content, "findme relative")
+		assert.Equal(t, path, gotPath)
 	})
 
 	t.Run("block decision returns guardian error", func(t *testing.T) {
@@ -545,7 +585,7 @@ func TestExecutePassesGuardianMetadataToSandbox(t *testing.T) {
 		},
 	})
 
-	sb := &metadataSandboxer{}
+	sb := &testSandboxer{}
 	setSandboxer(sb)
 
 	result, err := (&tool{}).Execute(context.Background(), map[string]any{
@@ -557,15 +597,17 @@ func TestExecutePassesGuardianMetadataToSandbox(t *testing.T) {
 	assert.Contains(t, result.Content, "findme")
 
 	require.NotEmpty(t, rootReq.ID)
-	require.NotEmpty(t, sb.calls)
+	require.NotEmpty(t, sb.requests)
 
-	for _, call := range sb.calls {
-		assert.NotEmpty(t, call.path)
-		assert.Equal(t, "grep", call.metadata["operation"])
-		assert.NotEmpty(t, call.metadata["guardian_request_id"])
+	for _, req := range sb.requests {
+		require.Len(t, req.Filesystem, 1)
+		assert.NotEmpty(t, req.Filesystem[0].Path)
+		assert.Equal(t, sdk.SandboxFilesystemRead, req.Filesystem[0].Access)
+		assert.Equal(t, "grep", req.Metadata["operation"])
+		assert.NotEmpty(t, req.Metadata["guardian_request_id"])
 	}
 
-	assert.Equal(t, rootReq.ID, sb.calls[0].metadata["guardian_request_id"])
+	assert.Equal(t, rootReq.ID, sb.requests[0].Metadata["guardian_request_id"])
 }
 
 func TestExecuteGuardianBlocksDirectoryChildBeforeRead(t *testing.T) {
@@ -843,62 +885,67 @@ func TestNoRespectGitignore(t *testing.T) {
 	assert.Contains(t, result.Content, "findme ignored")
 }
 
+func TestCleanRgFilePathSkipsVCSDependencyDirs(t *testing.T) {
+	tests := []string{
+		".git/config",
+		"node_modules/pkg/index.js",
+		"src/.hg/cache",
+		"src/.svn/entries",
+	}
+
+	for _, path := range tests {
+		t.Run(path, func(t *testing.T) {
+			_, ok := cleanRgFilePath(path, "", true)
+			assert.False(t, ok)
+		})
+	}
+
+	relPath, ok := cleanRgFilePath(".git/config", "", false)
+	assert.True(t, ok)
+	assert.Equal(t, filepath.Clean(".git/config"), relPath)
+}
+
 type testSandboxer struct {
-	allowReadFn  func(string) bool
-	allowWriteFn func(string) bool
-	wrapFn       func(cmd, dir string) (string, error)
+	allowReadFn        func(string) bool
+	requestExpansionFn func(context.Context, sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error)
+	requests           []sdk.SandboxExpansionRequest
 }
 
-func (ts *testSandboxer) WrapCommand(cmd, dir string) (string, error) {
-	if ts.wrapFn != nil {
-		return ts.wrapFn(cmd, dir)
+func (ts *testSandboxer) WrapCommand(context.Context, sdk.SandboxCommandRequest) (sdk.SandboxCommand, error) {
+	return sdk.SandboxCommand{}, nil
+}
+
+func (ts *testSandboxer) Status(context.Context) (sdk.SandboxStatus, error) {
+	return sdk.SandboxStatus{}, nil
+}
+
+func (ts *testSandboxer) RequestExpansion(ctx context.Context, req sdk.SandboxExpansionRequest) (sdk.SandboxExpansion, error) {
+	ts.requests = append(ts.requests, req)
+
+	if ts.requestExpansionFn != nil {
+		return ts.requestExpansionFn(ctx, req)
 	}
 
-	return cmd, nil
-}
+	allowed := true
 
-func (ts *testSandboxer) AllowWrite(path string) bool {
-	if ts.allowWriteFn != nil {
-		return ts.allowWriteFn(path)
-	}
-
-	return true
-}
-
-func (ts *testSandboxer) AllowRead(path string) bool {
 	if ts.allowReadFn != nil {
-		return ts.allowReadFn(path)
+		for _, fs := range req.Filesystem {
+			if fs.Access == sdk.SandboxFilesystemRead && !ts.allowReadFn(fs.Path) {
+				allowed = false
+				break
+			}
+		}
 	}
 
-	return true
+	if !allowed {
+		return sdk.SandboxExpansion{RequestID: req.ID, State: sdk.SandboxExpansionDenied, Reason: "path is protected"}, nil
+	}
+
+	return sdk.SandboxExpansion{RequestID: req.ID, State: sdk.SandboxExpansionAllowed}, nil
 }
 
-func (ts *testSandboxer) Mode() string   { return "auto" }
-func (ts *testSandboxer) SetMode(string) {}
-
-type metadataSandboxer struct {
-	path     string
-	metadata map[string]any
-	calls    []metadataSandboxCall
-}
-
-type metadataSandboxCall struct {
-	path     string
-	metadata map[string]any
-}
-
-func (m *metadataSandboxer) AllowRead(path string) bool {
-	m.path = path
-
-	return true
-}
-
-func (m *metadataSandboxer) AllowReadWithMetadata(path string, metadata map[string]any) bool {
-	m.path = path
-	m.metadata = metadata
-	m.calls = append(m.calls, metadataSandboxCall{path: path, metadata: metadata})
-
-	return true
+func (ts *testSandboxer) ResolveExpansion(context.Context, string, sdk.SandboxExpansionResolution) error {
+	return nil
 }
 
 type registrationGuardian struct{}
@@ -1437,7 +1484,7 @@ func TestParseRgLine(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, got, _ := parseRgLine([]byte(tt.line), baseDir, tt.include, tt.respectGitignore, "")
+			_, got, _ := parseRgLine(context.Background(), []byte(tt.line), baseDir, tt.include, tt.respectGitignore, "")
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -1453,7 +1500,7 @@ func TestParseRgLineSandboxDenied(t *testing.T) {
 	t.Cleanup(func() { setSandboxer(nil) })
 
 	line := `{"type":"match","data":{"path":{"text":"secret.txt"},"line_number":1,"lines":{"text":"findme secret"}}}`
-	_, got, _ := parseRgLine([]byte(line), dir, "", true, "")
+	_, got, _ := parseRgLine(context.Background(), []byte(line), dir, "", true, "")
 	assert.Empty(t, got)
 }
 

@@ -31,6 +31,7 @@ const (
 	ParamPattern = "pattern"
 	paramPath    = "path"
 	paramInclude = "include"
+	toolName     = "grep"
 	jsonType     = "type"
 	maxLineLen   = 500
 )
@@ -41,27 +42,19 @@ type tool struct {
 
 var (
 	sandboxerMu sync.RWMutex
-	sandboxer   readSandboxer
+	sandboxer   sdk.Sandboxer
 	guardianMu  sync.RWMutex
 	guardian    sdk.Guardian
 	requestSeq  atomic.Uint64
 )
 
-type readSandboxer interface {
-	AllowRead(path string) bool
-}
-
-type metadataReadSandboxer interface {
-	AllowReadWithMetadata(path string, metadata map[string]any) bool
-}
-
-func setSandboxer(s readSandboxer) {
+func setSandboxer(s sdk.Sandboxer) {
 	sandboxerMu.Lock()
 	sandboxer = s
 	sandboxerMu.Unlock()
 }
 
-func getSandboxer() readSandboxer {
+func getSandboxer() sdk.Sandboxer {
 	sandboxerMu.RLock()
 
 	s := sandboxer
@@ -103,7 +96,7 @@ func init() {
 		})
 
 		bus.On(sdk.SandboxRegisteredTopic, func(ev sdk.Event) error {
-			if s, ok := ev.Payload.(readSandboxer); ok {
+			if s, ok := ev.Payload.(sdk.Sandboxer); ok {
 				setSandboxer(s)
 			}
 
@@ -111,16 +104,16 @@ func init() {
 		})
 	})
 
-	sdk.RegisterTool("grep", func(cfg sdk.Config, _ sdk.PreferenceReader, _ struct{}) (sdk.Tool, error) {
+	sdk.RegisterTool(toolName, func(cfg sdk.Config, _ sdk.PreferenceReader, _ struct{}) (sdk.Tool, error) {
 		return &tool{cfg: cfg}, nil
 	})
 }
 
-func (t *tool) Name() string { return "grep" }
+func (t *tool) Name() string { return toolName }
 
 func (t *tool) Definition() sdk.ToolDef {
 	return sdk.ToolDef{
-		Name:        "grep",
+		Name:        toolName,
 		Description: "Search files for a pattern using regular expressions. Uses ripgrep when available for .gitignore support and faster searches; falls back to pure Go when rg is absent. Returns matching file:line:content entries.",
 		Parameters: map[string]any{
 			jsonType: "object",
@@ -168,12 +161,12 @@ func newRequestID(prefix string) string {
 func guardianRequest(path string) sdk.GuardianRequest {
 	return sdk.GuardianRequest{
 		ID:          newRequestID("grep-guardian"),
-		ToolName:    "grep",
+		ToolName:    toolName,
 		Action:      sdk.GuardianActionRead,
 		Path:        path,
 		Description: "Search file contents",
 		Metadata: map[string]any{
-			"operation": "grep",
+			"operation": toolName,
 		},
 	}
 }
@@ -235,21 +228,45 @@ func formatGuardianBlock(req sdk.GuardianRequest, decision sdk.GuardianDecision)
 	return b.String()
 }
 
-func allowSandboxRead(s readSandboxer, path, guardianRequestID string) bool {
+func allowSandboxRead(ctx context.Context, s sdk.Sandboxer, path, guardianRequestID string) (bool, string) {
 	if s == nil {
-		return true
+		return true, ""
 	}
 
-	metadata := map[string]any{
-		"operation":           "grep",
-		"guardian_request_id": guardianRequestID,
+	expansion, err := s.RequestExpansion(ctx, sdk.SandboxExpansionRequest{
+		ID:      newRequestID("grep-sandbox"),
+		Command: toolName,
+		Reason:  "Search file contents",
+		Filesystem: []sdk.SandboxFilesystemExpansion{
+			{Path: path, Access: sdk.SandboxFilesystemRead},
+		},
+		Metadata: map[string]any{
+			"operation":           toolName,
+			"guardian_request_id": guardianRequestID,
+		},
+	})
+	if err != nil {
+		return false, "sandbox expansion: " + err.Error()
 	}
 
-	if ms, ok := s.(metadataReadSandboxer); ok {
-		return ms.AllowReadWithMetadata(path, metadata)
+	if expansion.State == sdk.SandboxExpansionAllowed {
+		return true, ""
 	}
 
-	return s.AllowRead(path)
+	reason := expansion.Reason
+	if reason == "" && expansion.Resolution != nil {
+		reason = expansion.Resolution.Reason
+	}
+
+	if reason == "" && expansion.State != "" {
+		reason = "sandbox expansion " + string(expansion.State)
+	}
+
+	if reason == "" {
+		reason = "path is protected"
+	}
+
+	return false, reason
 }
 
 type searchParams struct {
@@ -293,18 +310,21 @@ func (t *tool) parseSearchParams(ctx context.Context, args map[string]any) (sear
 		}
 	}
 
-	guardianReq, guardianErr := checkGuardian(ctx, path)
-	if guardianErr != nil {
-		return searchParams{}, *guardianErr
-	}
-
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		return searchParams{}, sdk.ToolResult{Content: fmt.Sprintf("error: %s", err), IsError: true}
 	}
 
-	if s := getSandboxer(); !allowSandboxRead(s, absPath, guardianReq.ID) {
-		return searchParams{}, sdk.ToolResult{Content: "sandbox: read denied — path is protected", IsError: true}
+	guardianReq, guardianErr := checkGuardian(ctx, absPath)
+	if guardianErr != nil {
+		return searchParams{}, *guardianErr
+	}
+
+	if s := getSandboxer(); s != nil {
+		allowed, reason := allowSandboxRead(ctx, s, absPath, guardianReq.ID)
+		if !allowed {
+			return searchParams{}, sdk.ToolResult{Content: "sandbox: read denied — " + reason, IsError: true}
+		}
 	}
 
 	info, err := os.Stat(absPath)
@@ -447,7 +467,7 @@ func (pc *progressCollector) publish(final bool) {
 	}
 
 	pc.bus.Publish(sdk.NewEvent(sdk.TopicToolProgress, sdk.ToolProgress{
-		ToolName: "grep",
+		ToolName: toolName,
 		Content:  content,
 	}))
 }
@@ -559,30 +579,19 @@ func searchWithRipgrepFiles(ctx context.Context, rgPath, absPath, pattern, inclu
 			return matches, nil //nolint:nilerr // return partial matches on cancellation
 		}
 
-		relPath := filepath.Clean(scanner.Text())
-		if relPath == "." || strings.HasPrefix(relPath, ".."+string(filepath.Separator)) || filepath.IsAbs(relPath) {
+		relPath, ok := cleanRgFilePath(scanner.Text(), include, respectGitignore)
+		if !ok {
 			continue
 		}
 
-		if !fileMatchesInclude(include, filepath.Base(relPath)) {
-			continue
-		}
-
-		filePath := filepath.Join(absPath, relPath)
-
-		fileGuardianReq, guardianErr := checkGuardian(ctx, filePath)
-		if guardianErr != nil {
+		fileMatches, err := searchRipgrepFile(ctx, absPath, relPath, re, contextLines, onMatch)
+		if err != nil {
 			_ = cmd.Process.Kill()
 			_ = cmd.Wait()
 
-			return matches, errors.New(guardianErr.Content)
+			return matches, err
 		}
 
-		if s := getSandboxer(); !allowSandboxRead(s, filePath, fileGuardianReq.ID) {
-			continue
-		}
-
-		fileMatches := searchFile(ctx, relPath, filePath, re, contextLines, onMatch)
 		matches = append(matches, fileMatches...)
 	}
 
@@ -604,6 +613,41 @@ func searchWithRipgrepFiles(ctx context.Context, rgPath, absPath, pattern, inclu
 	}
 
 	return matches, nil
+}
+
+func cleanRgFilePath(path, include string, respectGitignore bool) (string, bool) {
+	relPath := filepath.Clean(path)
+	if relPath == "." || strings.HasPrefix(relPath, ".."+string(filepath.Separator)) || filepath.IsAbs(relPath) {
+		return "", false
+	}
+
+	if !fileMatchesInclude(include, filepath.Base(relPath)) {
+		return "", false
+	}
+
+	if respectGitignore && isSkipPath(filepath.ToSlash(relPath)) {
+		return "", false
+	}
+
+	return relPath, true
+}
+
+func searchRipgrepFile(ctx context.Context, absPath, relPath string, re *regexp.Regexp, contextLines int, onMatch func(file, match string)) ([]string, error) {
+	filePath := filepath.Join(absPath, relPath)
+
+	fileGuardianReq, guardianErr := checkGuardian(ctx, filePath)
+	if guardianErr != nil {
+		return nil, errors.New(guardianErr.Content)
+	}
+
+	if s := getSandboxer(); s != nil {
+		allowed, _ := allowSandboxRead(ctx, s, filePath, fileGuardianReq.ID)
+		if !allowed {
+			return nil, nil
+		}
+	}
+
+	return searchFile(ctx, relPath, filePath, re, contextLines, onMatch), nil
 }
 
 func searchWithRipgrep(ctx context.Context, rgPath, absPath string, isDir bool, pattern, include string, ignoreCase, literal bool, contextLines int, respectGitignore bool, guardianRequestID string, onMatch func(file, match string)) ([]string, error) {
@@ -641,7 +685,7 @@ func searchWithRipgrep(ctx context.Context, rgPath, absPath string, isDir bool, 
 			return matches, nil //nolint:nilerr // return partial matches on cancellation
 		}
 
-		file, match, isMatch := parseRgLine(scanner.Bytes(), searchPath, include, respectGitignore, guardianRequestID)
+		file, match, isMatch := parseRgLine(ctx, scanner.Bytes(), searchPath, include, respectGitignore, guardianRequestID)
 		if match != "" {
 			matches = append(matches, match)
 			if onMatch != nil && isMatch {
@@ -725,7 +769,7 @@ func handleRgScannerErr(ctx context.Context, cmd *exec.Cmd, scanErr error, match
 	return nil, fmt.Errorf("parsing rg output: %w", scanErr)
 }
 
-func parseRgLine(line []byte, baseDir, include string, respectGitignore bool, guardianRequestID string) (string, string, bool) {
+func parseRgLine(ctx context.Context, line []byte, baseDir, include string, respectGitignore bool, guardianRequestID string) (string, string, bool) {
 	var entry struct {
 		Type string `json:"type"`
 		Data struct {
@@ -767,8 +811,11 @@ func parseRgLine(line []byte, baseDir, include string, respectGitignore bool, gu
 		return "", "", false
 	}
 
-	if s := getSandboxer(); !allowSandboxRead(s, filepath.Join(baseDir, relPath), guardianRequestID) {
-		return "", "", false
+	if s := getSandboxer(); s != nil {
+		allowed, _ := allowSandboxRead(ctx, s, filepath.Join(baseDir, relPath), guardianRequestID)
+		if !allowed {
+			return "", "", false
+		}
 	}
 
 	if !fileMatchesInclude(include, filepath.Base(relPath)) {
@@ -810,8 +857,11 @@ func searchDir(ctx context.Context, root string, re *regexp.Regexp, contextLines
 			return errors.New(guardianErr.Content)
 		}
 
-		if s := getSandboxer(); !allowSandboxRead(s, walkPath, fileGuardianReq.ID) {
-			return nil
+		if s := getSandboxer(); s != nil {
+			allowed, _ := allowSandboxRead(ctx, s, walkPath, fileGuardianReq.ID)
+			if !allowed {
+				return nil
+			}
 		}
 
 		relPath, _ := filepath.Rel(root, walkPath)
