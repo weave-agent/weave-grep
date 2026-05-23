@@ -40,16 +40,16 @@ Add guardian policy enforcement to the `grep` tool so that file content search i
 - [x] Run grep tests — must pass before next task
 
 ### Task 2: Add guardian tests to grep_test.go
-- [ ] Write `TestExecuteWithGuardian` with subtests:
+- [x] Write `TestExecuteWithGuardian` with subtests:
   - "allow decision permits grep"
   - "block decision returns guardian error"
   - "missing guardian permits grep"
   - "guardian error returns tool error"
-- [ ] Write `TestExecuteGuardianSandboxOrdering`:
+- [x] Write `TestExecuteGuardianSandboxOrdering`:
   - "guardian allow runs before sandbox"
   - "guardian block skips sandbox"
-- [ ] Add `testGuardian` mock helper
-- [ ] Run grep tests — must pass
+- [x] Add `testGuardian` mock helper
+- [x] Run grep tests — must pass
 
 ### Task 3: Verify and cleanup
 - [ ] Run `make lint` in grep extension directory
