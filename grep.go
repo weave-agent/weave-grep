@@ -213,9 +213,11 @@ func formatGuardianBlock(req sdk.GuardianRequest, decision sdk.GuardianDecision)
 	if rule == "" {
 		rule = decision.MatchedGrantID
 	}
+
 	if rule == "" {
 		rule = decision.ID
 	}
+
 	if rule != "" {
 		b.WriteString("\nrule: ")
 		b.WriteString(rule)

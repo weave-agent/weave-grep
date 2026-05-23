@@ -52,9 +52,9 @@ Add guardian policy enforcement to the `grep` tool so that file content search i
 - [x] Run grep tests — must pass
 
 ### Task 3: Verify and cleanup
-- [ ] Run `make lint` in grep extension directory
-- [ ] Run full test suite for grep extension
-- [ ] Verify no regressions in existing grep functionality
+- [x] Run `make lint` in grep extension directory (no Makefile target; ran `golangci-lint run ./...` and `go vet ./...`)
+- [x] Run full test suite for grep extension
+- [x] Verify no regressions in existing grep functionality
 
 ## Technical Details
 
