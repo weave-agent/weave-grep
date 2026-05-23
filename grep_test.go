@@ -297,6 +297,8 @@ func TestGuardianRequest(t *testing.T) {
 }
 
 func TestCheckGuardianBlock(t *testing.T) {
+	origGuardian := getGuardian()
+
 	g := &testGuardian{
 		decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
 			assert.Equal(t, "/tmp/secret", req.Path)
@@ -312,7 +314,7 @@ func TestCheckGuardianBlock(t *testing.T) {
 	}
 	setGuardian(g)
 
-	t.Cleanup(func() { setGuardian(nil) })
+	t.Cleanup(func() { setGuardian(origGuardian) })
 
 	req, result := checkGuardian(context.Background(), "/tmp/secret")
 
@@ -332,6 +334,37 @@ func TestAllowSandboxReadPassesGuardianMetadata(t *testing.T) {
 	assert.Equal(t, "/tmp/file", sb.path)
 	assert.Equal(t, "grep", sb.metadata["operation"])
 	assert.Equal(t, "guardian-1", sb.metadata["guardian_request_id"])
+}
+
+func TestGuardianAndSandboxRegistration(t *testing.T) {
+	origGuardian := getGuardian()
+	origSandboxer := getSandboxer()
+
+	setGuardian(nil)
+	setSandboxer(nil)
+
+	t.Cleanup(func() {
+		setGuardian(origGuardian)
+		setSandboxer(origSandboxer)
+	})
+
+	bus := newRegistrationBus()
+	sdk.InvokeBusSubscribers(bus)
+
+	g := &registrationGuardian{}
+	s := &testSandboxer{}
+
+	bus.Publish(sdk.NewEvent(sdk.GuardianRegisteredTopic, g))
+	bus.Publish(sdk.NewEvent(sdk.SandboxRegisteredTopic, s))
+
+	assert.Same(t, g, getGuardian())
+	assert.Same(t, s, getSandboxer())
+
+	bus.Publish(sdk.NewEvent(sdk.GuardianRegisteredTopic, "not a guardian"))
+	bus.Publish(sdk.NewEvent(sdk.SandboxRegisteredTopic, "not a sandboxer"))
+
+	assert.Same(t, g, getGuardian())
+	assert.Same(t, s, getSandboxer())
 }
 
 func TestExecuteWithGuardian(t *testing.T) {
@@ -412,6 +445,35 @@ func TestExecuteWithGuardian(t *testing.T) {
 		assert.Contains(t, result.Content, "reason: blocked by policy")
 	})
 
+	t.Run("ask decision returns guardian error", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "ask.txt")
+		require.NoError(t, os.WriteFile(path, []byte("findme ask"), 0o644))
+
+		setGuardian(&testGuardian{
+			decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+				return sdk.GuardianDecision{
+					ID:        "decision-ask",
+					RequestID: req.ID,
+					Action:    sdk.GuardianDecisionAsk,
+				}, nil
+			},
+		})
+		setSandboxer(nil)
+
+		result, err := (&tool{}).Execute(context.Background(), map[string]any{
+			"pattern": "findme",
+			"path":    path,
+		})
+		require.NoError(t, err)
+		assert.True(t, result.IsError)
+		assert.Contains(t, result.Content, "guardian: blocked")
+		assert.Contains(t, result.Content, "action: read")
+		assert.Contains(t, result.Content, "rule: decision-ask")
+		assert.Contains(t, result.Content, "reason: guardian returned unresolved approval decision")
+		assert.NotContains(t, result.Content, "findme ask")
+	})
+
 	t.Run("missing guardian permits grep", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "normal.txt")
@@ -449,6 +511,57 @@ func TestExecuteWithGuardian(t *testing.T) {
 		assert.True(t, result.IsError)
 		assert.Contains(t, result.Content, "guardian: policy engine unavailable")
 	})
+}
+
+func TestExecutePassesGuardianMetadataToSandbox(t *testing.T) {
+	origGuardian := getGuardian()
+	origSandboxer := getSandboxer()
+
+	setGuardian(nil)
+	setSandboxer(nil)
+
+	t.Cleanup(func() {
+		setGuardian(origGuardian)
+		setSandboxer(origSandboxer)
+	})
+
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "one.txt"), []byte("findme one"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "two.txt"), []byte("findme two"), 0o644))
+
+	var gotReq sdk.GuardianRequest
+
+	setGuardian(&testGuardian{
+		decideFn: func(_ context.Context, req sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+			gotReq = req
+
+			return sdk.GuardianDecision{
+				ID:        "decision-allow",
+				RequestID: req.ID,
+				Action:    sdk.GuardianDecisionAllow,
+			}, nil
+		},
+	})
+
+	sb := &metadataSandboxer{}
+	setSandboxer(sb)
+
+	result, err := (&tool{}).Execute(context.Background(), map[string]any{
+		"pattern": "findme",
+		"path":    dir,
+	})
+	require.NoError(t, err)
+	assert.False(t, result.IsError)
+	assert.Contains(t, result.Content, "findme")
+
+	require.NotEmpty(t, gotReq.ID)
+	require.NotEmpty(t, sb.calls)
+
+	for _, call := range sb.calls {
+		assert.NotEmpty(t, call.path)
+		assert.Equal(t, "grep", call.metadata["operation"])
+		assert.Equal(t, gotReq.ID, call.metadata["guardian_request_id"])
+	}
 }
 
 func TestExecuteGuardianSandboxOrdering(t *testing.T) {
@@ -674,6 +787,12 @@ func (ts *testSandboxer) SetMode(string) {}
 type metadataSandboxer struct {
 	path     string
 	metadata map[string]any
+	calls    []metadataSandboxCall
+}
+
+type metadataSandboxCall struct {
+	path     string
+	metadata map[string]any
 }
 
 func (m *metadataSandboxer) AllowRead(path string) bool {
@@ -685,9 +804,48 @@ func (m *metadataSandboxer) AllowRead(path string) bool {
 func (m *metadataSandboxer) AllowReadWithMetadata(path string, metadata map[string]any) bool {
 	m.path = path
 	m.metadata = metadata
+	m.calls = append(m.calls, metadataSandboxCall{path: path, metadata: metadata})
 
 	return true
 }
+
+type registrationGuardian struct{}
+
+func (g *registrationGuardian) Decide(context.Context, sdk.GuardianRequest) (sdk.GuardianDecision, error) {
+	return sdk.GuardianDecision{Action: sdk.GuardianDecisionAllow}, nil
+}
+
+func (g *registrationGuardian) Resolve(context.Context, string, sdk.GuardianResolution) error {
+	return nil
+}
+
+func (g *registrationGuardian) Snapshot(context.Context) (sdk.GuardianSnapshot, error) {
+	return sdk.GuardianSnapshot{}, nil
+}
+
+type registrationBus struct {
+	handlers map[string][]sdk.Handler
+}
+
+func newRegistrationBus() *registrationBus {
+	return &registrationBus{handlers: make(map[string][]sdk.Handler)}
+}
+
+func (r *registrationBus) Publish(ev sdk.Event) {
+	for _, h := range r.handlers[ev.Topic] {
+		_ = h(ev)
+	}
+}
+
+func (r *registrationBus) On(topic string, h sdk.Handler) {
+	r.handlers[topic] = append(r.handlers[topic], h)
+}
+
+func (r *registrationBus) OnAll(sdk.Handler) {}
+
+func (r *registrationBus) Off(sdk.Handler) {}
+
+func (r *registrationBus) Close() error { return nil }
 
 type testGuardian struct {
 	decideFn func(context.Context, sdk.GuardianRequest) (sdk.GuardianDecision, error)

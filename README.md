@@ -20,6 +20,7 @@ weave install github.com/weave-agent/weave-grep --name grep
 
 - Searches with ripgrep when available, falls back to Go stdlib regex
 - Publishes streaming `tool.progress` bus events as matches are found (throttled to 200ms)
+- Enforces Guardian read policies before searching file contents
 - Respects context cancellation for interruptible searches
 - Respects `.gitignore` and skips VCS/dependency directories
 

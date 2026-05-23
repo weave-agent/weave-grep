@@ -1,5 +1,8 @@
 # Guardian Integration for grep Tool
 
+Status: Completed
+Completed: 2026-05-23
+
 ## Overview
 Add guardian policy enforcement to the `grep` tool so that file content search is subject to the guardian's allow/ask/block decisions. The `grep` tool searches file contents — this is a `GuardianActionRead` action.
 

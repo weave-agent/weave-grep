@@ -1,5 +1,11 @@
 # CLAUDE.md — weave-grep
 
+## Guardian Policy Pattern
+
+The grep tool registers a guardian from `sdk.GuardianRegisteredTopic` and checks it before sandbox reads. `guardianRequest` uses `sdk.GuardianActionRead`, `ToolName: "grep"`, and metadata `operation: "grep"`.
+
+Execution order is: validate args, check guardian, resolve the absolute path, check sandbox, then search. Guardian blocks and guardian errors return tool errors before sandbox checks run. Sandbox reads use `AllowReadWithMetadata` when available and include `guardian_request_id` so sandbox decisions can be correlated with guardian decisions.
+
 ## Streaming Progress Pattern
 
 The grep tool emits `tool.progress` bus events while searching. This is implemented via:
